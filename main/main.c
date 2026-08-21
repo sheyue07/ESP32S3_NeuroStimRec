@@ -26,16 +26,10 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "raw_sd_segment_recorder.h"
-#include "raw_write_benchmark.h"
-
-/* Set to 1 only to run the synthetic fixed-location write benchmark. */
-#define RAW_WRITE_BENCHMARK 0
-
-#if !RAW_WRITE_BENCHMARK
 
 static const char *TAG = "ADC_SD_LOGGER";
 
-#define RECORD_SWITCH_GPIO          GPIO_NUM_18
+#define RECORD_SWITCH_GPIO          GPIO_NUM_7
 #define SWITCH_DEBOUNCE_MS          200
 #define SWITCH_DEBOUNCE_SAMPLE_MS   5
 
@@ -811,7 +805,7 @@ static void close_failed_start(recording_context_t *context)
     set_capture_enabled(false);
 }
 
-static bool gpio18_level_is_stable(bool expected_high)
+static bool gpio7_level_is_stable(bool expected_high)
 {
     const TickType_t stable_ticks = pdMS_TO_TICKS(SWITCH_DEBOUNCE_MS);
     const TickType_t sample_ticks = pdMS_TO_TICKS(SWITCH_DEBOUNCE_SAMPLE_MS);
@@ -841,7 +835,7 @@ static void sd_write_task(void *parameter)
     };
     const esp_err_t gpio_result = gpio_config(&switch_config);
     if (gpio_result != ESP_OK) {
-        ESP_LOGE(TAG, "GPIO18 initialization failed: 0x%x (%s)",
+        ESP_LOGE(TAG, "GPIO7 initialization failed: 0x%x (%s)",
                  (unsigned int)gpio_result, esp_err_to_name(gpio_result));
         vTaskDelete(NULL);
         return;
@@ -852,7 +846,7 @@ static void sd_write_task(void *parameter)
     int64_t last_log_time_us = 0;
 
     ESP_LOGI(TAG,
-             "GPIO18 stable high for %u ms starts capture; stable low stops it",
+             "GPIO7 stable high for %u ms starts capture; stable low stops it",
              SWITCH_DEBOUNCE_MS);
 
     while (true) {
@@ -869,7 +863,7 @@ static void sd_write_task(void *parameter)
                 continue;
             }
 
-            if (!gpio18_level_is_stable(true)) {
+            if (!gpio7_level_is_stable(true)) {
                 continue;
             }
 
@@ -915,9 +909,9 @@ static void sd_write_task(void *parameter)
         }
 
         if (!switch_high) {
-            if (gpio18_level_is_stable(false)) {
+            if (gpio7_level_is_stable(false)) {
                 stop_pipeline_drain_and_finish(
-                    &context, "GPIO18 became low");
+                    &context, "GPIO7 became low");
                 currently_recording = false;
                 continue;
             }
@@ -965,13 +959,8 @@ static void sd_write_task(void *parameter)
     }
 }
 
-#endif
-
 void app_main(void)
 {
-#if RAW_WRITE_BENCHMARK
-    raw_write_benchmark_app_main();
-#else
     ESP_LOGI(TAG, "ESP32-S3 continuous external-clock ADC logger starting");
     ESP_LOGI(TAG,
              "Capture input: CLK=GPIO%d, DATA=GPIO%d, %u Hz",
@@ -1131,5 +1120,4 @@ void app_main(void)
         continuous_rx_deinit();
         return;
     }
-#endif
 }

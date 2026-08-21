@@ -6,7 +6,7 @@
 
 - ADC 时钟：GPIO20，30 MHz，外部时钟，上升沿采样
 - ADC 串行数据：GPIO16，MSB first
-- 采集开关：GPIO18，高、低电平均需连续稳定 200 ms 才触发开始或停止
+- 采集开关：GPIO7，高、低电平均需连续稳定 200 ms 才触发开始或停止
 - SD 卡：SDMMC 4-bit，20 MHz
 - ADC 帧：260 字节（2080 bit）
 - 帧头：`FF FF 00 00`
@@ -14,16 +14,9 @@
 
 ADC 发送端的 260 字节格式没有被修改；所有同步诊断单独保存在 SD 元数据区域。
 
-## GPIO7 与工程拆分设计（待实施）
+## 工程职责
 
-本次改动将把正式 ADC 采集固件和 1 GiB SD 写入测速固件完全分开：
-
-- 本工程及 GitHub 的 `main`、`ESP32_Code_0820` 分支只保留 ADC 采集入口；删除 `RAW_WRITE_BENCHMARK` 条件编译、`raw_write_benchmark.c/.h` 及对应 CMake 源文件。
-- 两个采集分支的启停开关均由 GPIO18 改为 GPIO7；各分支现有的去抖和帧同步策略保持不变。
-- `ESP32S3_Raw_SD_Write_Benchmark` 独立工程只保留 1 GiB 原始 SD 写入测速入口和必需的 SD 记录器依赖，不再编译 ADC 接收、帧同步和正式采集任务。
-- 独立测速工程的开关也统一为 GPIO7，但与采集工程互不依赖。
-- `ESP32_Code_0820` 的 README 将补充引脚、数据格式、启停方式、构建步骤、裸 SD 覆盖警告和该分支所使用的同步策略，不会误写成当前 `main` 的新算法。
-- 验收要求为：采集工程不再包含 benchmark 符号或源文件；三个目标均不再引用 GPIO18；两个采集分支和独立 benchmark 均能通过 ESP-IDF 编译。
+本工程只负责 ADC 串行采集、帧同步和裸 SD 分段写入，不再包含 1 GiB SD 写入测速入口。测速固件已独立保存在 `ESP32S3_Raw_SD_Write_Benchmark` 工程，两个工程互不依赖。
 
 ## 同步恢复策略
 
@@ -82,4 +75,4 @@ python -m unittest discover -s test -p "test_*.py"
 
 ## 仓库范围
 
-发布分支只包含源码、构建配置、测试、读取工具和本 README；不包含 `build` 目录及任何采集数据。
+发布分支只包含固件源码、构建配置和本 README；不包含 `build` 目录及任何采集数据。
