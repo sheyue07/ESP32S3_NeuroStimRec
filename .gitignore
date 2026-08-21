@@ -19,6 +19,9 @@
 # Local ADC capture datasets (for example data0820 and data0821)
 /data[0-9]*/
 
+# Local isolated Git worktrees used for branch-safe development
+/.worktrees/
+
 # Build artifacts and directories
 **/build/
 build/
