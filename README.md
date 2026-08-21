@@ -14,6 +14,17 @@
 
 ADC 发送端的 260 字节格式没有被修改；所有同步诊断单独保存在 SD 元数据区域。
 
+## GPIO7 与工程拆分设计（待实施）
+
+本次改动将把正式 ADC 采集固件和 1 GiB SD 写入测速固件完全分开：
+
+- 本工程及 GitHub 的 `main`、`ESP32_Code_0820` 分支只保留 ADC 采集入口；删除 `RAW_WRITE_BENCHMARK` 条件编译、`raw_write_benchmark.c/.h` 及对应 CMake 源文件。
+- 两个采集分支的启停开关均由 GPIO18 改为 GPIO7；各分支现有的去抖和帧同步策略保持不变。
+- `ESP32S3_Raw_SD_Write_Benchmark` 独立工程只保留 1 GiB 原始 SD 写入测速入口和必需的 SD 记录器依赖，不再编译 ADC 接收、帧同步和正式采集任务。
+- 独立测速工程的开关也统一为 GPIO7，但与采集工程互不依赖。
+- `ESP32_Code_0820` 的 README 将补充引脚、数据格式、启停方式、构建步骤、裸 SD 覆盖警告和该分支所使用的同步策略，不会误写成当前 `main` 的新算法。
+- 验收要求为：采集工程不再包含 benchmark 符号或源文件；三个目标均不再引用 GPIO18；两个采集分支和独立 benchmark 均能通过 ESP-IDF 编译。
+
 ## 同步恢复策略
 
 状态机为 `ACQUIRE -> COHORT -> LOCKED -> HOLDOVER`，必要时从 `HOLDOVER` 回到全局搜索。
