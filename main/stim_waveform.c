@@ -293,7 +293,7 @@ static esp_err_t stim_waveform_configure_lcd_cam(void)
     PERIPH_RCC_ATOMIC() {
         lcd_ll_enable_clock(dev, true);
         lcd_ll_select_clk_src(dev, LCD_CLK_SRC_PLL160M);
-        lcd_ll_set_group_clock_coeff(dev, 24, 33, 8);
+        lcd_ll_set_group_clock_coeff(dev, 12, 33, 4);
     }
     lcd_ll_reset(dev);
     lcd_ll_fifo_reset(dev);
@@ -306,15 +306,15 @@ static esp_err_t stim_waveform_configure_lcd_cam(void)
     lcd_ll_enable_swizzle(dev, false);
     lcd_ll_set_clock_idle_level(dev, false);
     lcd_ll_set_pixel_clock_edge(dev, true);
-    lcd_ll_set_pixel_clock_prescale(dev, 1);
+    lcd_ll_set_pixel_clock_prescale(dev, 2);
     /*
-     * ESP32-S3 erratum LCD-239 requires more than two LCD_CLK cycles before
-     * I8080 data when PCLK uses LCD_CLK directly.  Two command cycles plus
-     * one dummy cycle give ahead_cycle=3.  The duplicated 0x03 command keeps
-     * D1=CSb and D0=MOSI high throughout this one-time startup preamble.
+     * ESP32-S3 erratum LCD-239 requires ahead_cycle > 2.  Run the LCD core at
+     * exactly 13.2 MHz and divide PCLK by two; two command pixels therefore
+     * give four LCD_CLK cycles before DMA data.  Both command bytes are 0x03,
+     * keeping D1=CSb and D0=MOSI high during this one-time startup preamble.
      */
     lcd_ll_set_command(dev, 8, 0x0303U);
-    lcd_ll_set_phase_cycles(dev, 2, 1, 1);
+    lcd_ll_set_phase_cycles(dev, 2, 0, 1);
     lcd_ll_set_blank_cycles(dev, 0, 0);
     lcd_ll_enable_output_always_on(dev, true);
     PERIPH_RCC_ATOMIC() {
@@ -517,7 +517,7 @@ esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
     ESP_LOGI(TAG,
              "LCD_CAM/GDMA running: SCLK=GPIO%d, mclkST=GPIO%d, "
              "MOSI=GPIO%d, CSb=GPIO%d, clock=%u Hz "
-             "(PLL160 / (24 + 8/33) / 1)",
+             "(PLL160 / (12 + 4/33) / 2)",
              STIM_SCLK_GPIO, STIM_MCLK_GPIO, STIM_MOSI_GPIO, STIM_CSB_GPIO,
              STIM_CLOCK_HZ);
     return ESP_OK;

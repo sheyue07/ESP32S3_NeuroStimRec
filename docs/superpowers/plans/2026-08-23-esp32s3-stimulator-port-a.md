@@ -62,7 +62,7 @@
 - 测试：`host_tests/test_stim_integration.py`
 
 1. 在内部 DMA RAM 静态预分配三个规范 buffer 和所有 `dma_descriptor_t`；运行期不生成波形、不分配 DMA buffer/descriptor。
-2. LCD_CAM 时钟固定使用 PLL160，设置 `div_num=24, div_a=33, div_b=8`、PCLK prescale=1，得到 6.600 MHz。
+2. LCD_CAM 时钟固定使用 PLL160。为规避 ESP32-S3 LCD-239，设置 `div_num=12, div_a=33, div_b=4` 得到 13.2 MHz LCD 核心时钟，再设 PCLK prescale=2，输出仍精确为 6.600 MHz；启动前发送两个高电平命令像素，使 DMA 数据前具有 4 个 LCD 核心周期。
 3. GPIO8 连接 LCD PCLK，GPIO19 连接同一 PCLK 的反相信号；GPIO17/D0=MOSI，GPIO15/D1=CSb，不路由其他 LCD data pins。
 4. 使用连续 AHB GDMA descriptor 链输出：STOP_LOOP 自循环；START_SEQUENCE 十个 101-byte descriptor；ENABLED_IDLE 自循环。
 5. 状态切换只改 descriptor 边界链接，不停 LCD_CAM/GDMA；低电平请求不得截断正在发送的 40-bit 帧。
@@ -110,4 +110,3 @@
 4. 对照基线确认 ADC 30 MHz SPI2、GPIO7 开关、SDMMC 4-bit 20 MHz、260-byte 帧和 raw SD layout 未改变。
 5. 输出硬件验收清单：示波器测 GPIO8=6.600 MHz、GPIO19 精确反相、40 low/61 high、GPIO6 切换延迟；ADC+刺激并发连续 30 min，确认 DMA/PSRAM/SD 无新增错误。
 6. 无真实开发板/示波器结果时明确标记“硬件验证待执行”，不得把构建成功描述成硬件通过。
-

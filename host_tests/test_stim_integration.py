@@ -53,8 +53,8 @@ class StimIntegrationTests(unittest.TestCase):
         self.assertIn("GPIO_NUM_15", header)
         self.assertIn("GPIO_NUM_6", controller)
         self.assertIn("LCD_CLK_SRC_PLL160M", source)
-        self.assertRegex(source, r"lcd_ll_set_group_clock_coeff\([^;]+24\s*,\s*33\s*,\s*8\s*\)")
-        self.assertRegex(source, r"lcd_ll_set_pixel_clock_prescale\([^;]+1\s*\)")
+        self.assertRegex(source, r"lcd_ll_set_group_clock_coeff\([^;]+12\s*,\s*33\s*,\s*4\s*\)")
+        self.assertRegex(source, r"lcd_ll_set_pixel_clock_prescale\([^;]+2\s*\)")
         self.assertIn("LCD_PCLK_IDX", source)
         self.assertIn("LCD_DATA_OUT0_IDX", source)
         self.assertIn("LCD_DATA_OUT1_IDX", source)
@@ -68,7 +68,7 @@ class StimIntegrationTests(unittest.TestCase):
         )
         self.assertRegex(
             source,
-            r"lcd_ll_set_phase_cycles\(\s*dev\s*,\s*2\s*,\s*1\s*,\s*1\s*\)",
+            r"lcd_ll_set_phase_cycles\(\s*dev\s*,\s*2\s*,\s*0\s*,\s*1\s*\)",
         )
 
     def test_stimulator_uses_lcd_cam_gdma_not_fallback_peripherals(self):
