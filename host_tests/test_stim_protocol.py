@@ -24,12 +24,12 @@ GOLDEN_FRAMES = [
 def source_frames():
     text = SOURCE.read_text(encoding="utf-8")
     match = re.search(
-        r"stim_start_frames\s*\[[^;=]*=\s*\{(?P<body>.*?)\n\};",
+        r"stim_start_golden_frames\s*\[[^;=]*=\s*\{(?P<body>.*?)\n\};",
         text,
         flags=re.S,
     )
     if not match:
-        raise AssertionError("stim_start_frames initializer not found")
+        raise AssertionError("stim_start_golden_frames initializer not found")
     rows = re.findall(r"\{([^{}]+)\}", match.group("body"))
     return [
         [int(token.strip().rstrip("UuLl"), 0) for token in row.split(",")]
@@ -50,7 +50,13 @@ class StimProtocolTests(unittest.TestCase):
         self.assertRegex(header, r"#define\s+STIM_PROTOCOL_FRAME_BYTES\s+5U")
         self.assertRegex(header, r"#define\s+STIM_PROTOCOL_START_FRAME_COUNT\s+10U")
 
+    def test_frames_are_generated_from_fields_then_compared_with_goldens(self):
+        text = SOURCE.read_text(encoding="utf-8")
+        self.assertIn("stim_protocol_build_frame", text)
+        self.assertIn("s_start_commands", text)
+        self.assertIn("stim_protocol_build_start_frames", text)
+        self.assertIn("memcmp", text)
+
 
 if __name__ == "__main__":
     unittest.main()
-

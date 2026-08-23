@@ -23,7 +23,8 @@ typedef enum {
     STIM_WAVEFORM_FAULT,
 } stim_waveform_state_t;
 
-typedef bool (*stim_waveform_fault_callback_t)(void *user_data);
+typedef bool (*stim_waveform_event_callback_t)(stim_waveform_state_t event,
+                                               void *user_data);
 
 typedef struct {
     stim_waveform_state_t state;
@@ -31,9 +32,11 @@ typedef struct {
     bool fatal;
     uint32_t completed_start_frames;
     uint32_t descriptor_errors;
+    uint32_t fifo_underflow_errors;
+    uint32_t unexpected_stop_errors;
 } stim_waveform_status_t;
 
-esp_err_t stim_waveform_init(stim_waveform_fault_callback_t fault_callback,
+esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
                              void *user_data);
 esp_err_t stim_waveform_request_enabled(bool enabled);
 void stim_waveform_enter_safe_state(void);
@@ -42,4 +45,3 @@ void stim_waveform_get_status(stim_waveform_status_t *status);
 #ifdef __cplusplus
 }
 #endif
-

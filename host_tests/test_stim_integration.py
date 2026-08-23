@@ -73,8 +73,16 @@ class StimIntegrationTests(unittest.TestCase):
         text = (MAIN / "stim_controller.c").read_text(encoding="utf-8")
         self.assertRegex(text, r"STIM_DEBOUNCE_US\s+100U")
         self.assertIn("GPIO_INTR_ANYEDGE", text)
-        self.assertIn("xQueueSendFromISR", text)
+        self.assertIn("xTaskNotifyFromISR", text)
+        self.assertNotIn("xQueueSend", text)
         self.assertIn("esp_timer_restart", text)
+
+    def test_waveform_completion_and_faults_are_reported_to_task(self):
+        text = (MAIN / "stim_controller.c").read_text(encoding="utf-8")
+        self.assertIn("STIM_NOTIFY_SEQUENCE_COMPLETE", text)
+        self.assertIn("STIM_NOTIFY_STOP_ACTIVE", text)
+        self.assertIn("fifo_underflow_errors", text)
+        self.assertIn("unexpected_stop_errors", text)
 
 
 if __name__ == "__main__":

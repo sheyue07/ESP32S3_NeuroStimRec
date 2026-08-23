@@ -48,6 +48,55 @@ class StimWaveformTests(unittest.TestCase):
         self.assertIn("STIM_SAMPLE_CSB", source)
         self.assertNotRegex(source, r"0x0[4-9A-Fa-f]|0x[1-9A-Fa-f]")
 
+    def test_stop_loop_repeats_frame_stop_not_idle(self):
+        source = (ROOT / "main" / "stim_waveform_builder.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "stim_waveform_build_slot(start_frames[0], stop_loop)", source
+        )
+        stop_slot = compile_slot(GOLDEN_FRAMES[0])
+        self.assertNotEqual(stop_slot, [0x03] * 101)
+        self.assertEqual(stop_slot[40:], [0x03] * 61)
+
+    def test_runtime_buffer_self_check_is_called_before_dma_start(self):
+        builder = (ROOT / "main" / "stim_waveform_builder.c").read_text(
+            encoding="utf-8"
+        )
+        waveform = (ROOT / "main" / "stim_waveform.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("stim_waveform_validate_buffers", builder)
+        self.assertIn("stim_waveform_validate_buffers", waveform)
+        self.assertLess(
+            waveform.index("stim_waveform_validate_buffers"),
+            waveform.index("gdma_start"),
+        )
+
+    def test_fault_paths_monitor_fifo_underflow_and_lcd_stop(self):
+        source = (ROOT / "main" / "stim_waveform.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("GDMA_LL_EVENT_TX_L1_FIFO_UDF", source)
+        self.assertIn("GDMA_LL_EVENT_TX_L3_FIFO_UDF", source)
+        self.assertIn("GDMA_LL_EVENT_TX_DESC_ERROR", source)
+        self.assertIn("LCD_LL_EVENT_TRANS_DONE", source)
+        self.assertIn("stim_waveform_quench_from_isr", source)
+        self.assertNotIn("gdma_register_tx_event_callbacks", source)
+
+    def test_low_request_can_cancel_a_not_yet_started_sequence(self):
+        source = (ROOT / "main" / "stim_waveform.c").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("s_stop_descriptor.next = &s_stop_descriptor;", source)
+        self.assertIn(
+            "s_enabled_descriptor.next = &s_stop_entry_descriptor;", source
+        )
+        self.assertIn(
+            "s_start_descriptors[index].next = &s_stop_entry_descriptor;",
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

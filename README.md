@@ -22,6 +22,11 @@ slot，再返回 STOP_LOOP。常态 STOP/IDLE 循环不会产生逐帧中断，�
 
 刺激 GDMA 初始化或运行失败时，GPIO15/17 被切回 GPIO 输出并保持高电平，
 错误只记录到日志；ADC/SPI2、PSRAM ring、帧同步和 SDMMC 任务仍继续运行。
+固件分别统计 GDMA 描述符错误、两级 TX FIFO 欠载和 LCD_CAM 意外停止；运行故障
+由 IRAM 中断路径立即停止刺激 DMA/时钟并拉高 CSb/MOSI，再由控制任务输出诊断日志。
+
+GPIO8 与 GPIO19 是连续高速时钟。两线应尽量短、与 FPGA 共地，并在示波器实测后
+选择合适的 GPIO 驱动强度；不要默认直接使用最大驱动强度。
 
 ### 刺激端口硬件验收
 
@@ -101,10 +106,11 @@ python tools/read_raw_sd_segments.py --image capture.img --segment 1 --output-di
 ## 测试
 
 ```powershell
-python -m unittest discover -s test -p "test_*.py"
+python -m unittest discover -s host_tests -p "test_*.py" -v
 ```
 
-测试覆盖按键去抖、帧格式、8 帧快速锁定、0～7 bit 偏移、单帧错误快速恢复、稀疏错误、bit 失步、多候选首选策略、段状态、元数据校验和读取工具兼容性。
+刺激端口测试覆盖协议字段构造、10 个黄金帧、40/61 样本槽、MSB first、静态缓冲区、
+FrameStop 循环、GPIO6 去抖、资源冲突、故障监测，以及 ADC/SD 关键实现文件未改动。
 
 ## 仓库范围
 
