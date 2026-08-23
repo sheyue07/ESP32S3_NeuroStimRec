@@ -436,6 +436,7 @@ esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
         return ESP_OK;
     }
 
+    s_waveform.fatal = false;
     esp_err_t result = stim_waveform_configure_safe_gpio();
     if (result != ESP_OK) {
         return result;

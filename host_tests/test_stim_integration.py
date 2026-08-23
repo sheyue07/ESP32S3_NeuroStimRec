@@ -105,6 +105,12 @@ class StimIntegrationTests(unittest.TestCase):
         self.assertIn("stim_waveform_deinit", waveform)
         self.assertIn("stim_waveform_deinit", header)
 
+    def test_waveform_can_be_reinitialized_after_deinit(self):
+        waveform = (MAIN / "stim_waveform.c").read_text(encoding="utf-8")
+        init_body = waveform.split("esp_err_t stim_waveform_init", 1)[1]
+        init_body = init_body.split("esp_err_t stim_waveform_request_enabled", 1)[0]
+        self.assertIn("s_waveform.fatal = false", init_body)
+
 
 if __name__ == "__main__":
     unittest.main()
