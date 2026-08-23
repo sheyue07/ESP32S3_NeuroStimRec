@@ -35,6 +35,7 @@ typedef struct {
     int64_t last_edge_time_us;
     int pending_level;
     bool committed_enabled;
+    bool gpio_handler_registered;
 } stim_controller_context_t;
 
 static stim_controller_context_t s_controller;
@@ -114,7 +115,6 @@ static void stim_controller_task(void *argument)
                      status.descriptor_errors,
                      status.fifo_underflow_errors,
                      status.unexpected_stop_errors);
-            stim_waveform_enter_safe_state();
             continue;
         }
 
@@ -179,6 +179,27 @@ static void stim_controller_task(void *argument)
     }
 }
 
+static void stim_controller_cleanup(void)
+{
+    if (s_controller.gpio_handler_registered) {
+        (void)gpio_isr_handler_remove(STIM_ENABLE_GPIO);
+        s_controller.gpio_handler_registered = false;
+    }
+    if (s_controller.debounce_timer != NULL) {
+        if (esp_timer_is_active(s_controller.debounce_timer)) {
+            (void)esp_timer_stop(s_controller.debounce_timer);
+        }
+        (void)esp_timer_delete(s_controller.debounce_timer);
+        s_controller.debounce_timer = NULL;
+    }
+    stim_waveform_deinit();
+    if (s_controller.task != NULL) {
+        TaskHandle_t task = s_controller.task;
+        s_controller.task = NULL;
+        vTaskDelete(task);
+    }
+}
+
 esp_err_t stim_controller_init(void)
 {
     s_controller.task = xTaskCreateStaticPinnedToCore(
@@ -197,7 +218,7 @@ esp_err_t stim_controller_init(void)
 
     esp_err_t result = stim_waveform_init(stim_waveform_event_isr, NULL);
     if (result != ESP_OK) {
-        stim_waveform_enter_safe_state();
+        stim_controller_cleanup();
         return result;
     }
 
@@ -210,7 +231,7 @@ esp_err_t stim_controller_init(void)
     };
     result = esp_timer_create(&timer_args, &s_controller.debounce_timer);
     if (result != ESP_OK) {
-        stim_waveform_enter_safe_state();
+        stim_controller_cleanup();
         return result;
     }
 
@@ -223,20 +244,21 @@ esp_err_t stim_controller_init(void)
     };
     result = gpio_config(&input_config);
     if (result != ESP_OK) {
-        stim_waveform_enter_safe_state();
+        stim_controller_cleanup();
         return result;
     }
 
     result = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (result != ESP_OK && result != ESP_ERR_INVALID_STATE) {
-        stim_waveform_enter_safe_state();
+        stim_controller_cleanup();
         return result;
     }
     result = gpio_isr_handler_add(STIM_ENABLE_GPIO, stim_gpio_isr, NULL);
     if (result != ESP_OK) {
-        stim_waveform_enter_safe_state();
+        stim_controller_cleanup();
         return result;
     }
+    s_controller.gpio_handler_registered = true;
 
     s_controller.pending_level = gpio_get_level(STIM_ENABLE_GPIO);
     s_controller.committed_enabled = false;

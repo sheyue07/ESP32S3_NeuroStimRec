@@ -14,6 +14,8 @@
 波形由 LCD_CAM 8-bit 并行发送端和循环 AHB GDMA 产生。DMA byte 仅使用
 bit0（MOSI）和 bit1（CSb）；bit7:2 恒为 0。LCD 时钟源固定为 PLL160，
 分频为 `24 + 8/33`，PCLK 分频为 1，目标输出恰为 6.600 MHz。
+LCD_CAM 仅在整条循环链启动时先输出 3 个 `CSb=1, MOSI=1` 的空闲时钟，
+用于规避 ESP32-S3 LCD-239 勘误；随后每个 DMA slot 仍严格为 40+61 个时钟。
 
 GPIO6 低电平时循环输出 STOP/IDLE slot；稳定变高后只发送一次规范规定的
 10 个 5-byte 配置帧，再进入 ENABLED_IDLE；稳定变低时先完成当前 101-clock

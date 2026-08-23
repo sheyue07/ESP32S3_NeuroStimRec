@@ -40,6 +40,7 @@ esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
                              void *user_data);
 esp_err_t stim_waveform_request_enabled(bool enabled);
 void stim_waveform_enter_safe_state(void);
+void stim_waveform_deinit(void);
 void stim_waveform_get_status(stim_waveform_status_t *status);
 
 #ifdef __cplusplus

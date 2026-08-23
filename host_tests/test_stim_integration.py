@@ -59,6 +59,18 @@ class StimIntegrationTests(unittest.TestCase):
         self.assertIn("LCD_DATA_OUT0_IDX", source)
         self.assertIn("LCD_DATA_OUT1_IDX", source)
 
+    def test_lcd_239_startup_workaround_keeps_control_lines_idle(self):
+        source = (MAIN / "stim_waveform.c").read_text(encoding="utf-8")
+        self.assertIn("LCD-239", source)
+        self.assertRegex(
+            source,
+            r"lcd_ll_set_command\(\s*dev\s*,\s*8\s*,\s*0x0303U\s*\)",
+        )
+        self.assertRegex(
+            source,
+            r"lcd_ll_set_phase_cycles\(\s*dev\s*,\s*2\s*,\s*1\s*,\s*1\s*\)",
+        )
+
     def test_stimulator_uses_lcd_cam_gdma_not_fallback_peripherals(self):
         text = "\n".join(
             path.read_text(encoding="utf-8")
@@ -83,6 +95,15 @@ class StimIntegrationTests(unittest.TestCase):
         self.assertIn("STIM_NOTIFY_STOP_ACTIVE", text)
         self.assertIn("fifo_underflow_errors", text)
         self.assertIn("unexpected_stop_errors", text)
+
+    def test_partial_initialization_has_a_full_teardown_path(self):
+        controller = (MAIN / "stim_controller.c").read_text(encoding="utf-8")
+        waveform = (MAIN / "stim_waveform.c").read_text(encoding="utf-8")
+        header = (MAIN / "stim_waveform.h").read_text(encoding="utf-8")
+        self.assertIn("stim_controller_cleanup", controller)
+        self.assertIn("stim_waveform_deinit", controller)
+        self.assertIn("stim_waveform_deinit", waveform)
+        self.assertIn("stim_waveform_deinit", header)
 
 
 if __name__ == "__main__":

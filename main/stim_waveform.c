@@ -195,8 +195,9 @@ static bool IRAM_ATTR stim_waveform_process_eof(
                          STIM_WAVEFORM_ENABLED_IDLE)
                    : false;
     }
+    ++s_waveform.unexpected_stop_errors;
     portEXIT_CRITICAL_ISR(&s_waveform.lock);
-    return false;
+    return stim_waveform_quench_from_isr();
 }
 
 static void IRAM_ATTR stim_waveform_gdma_isr(void *argument)
@@ -306,7 +307,14 @@ static esp_err_t stim_waveform_configure_lcd_cam(void)
     lcd_ll_set_clock_idle_level(dev, false);
     lcd_ll_set_pixel_clock_edge(dev, true);
     lcd_ll_set_pixel_clock_prescale(dev, 1);
-    lcd_ll_set_phase_cycles(dev, 0, 0, 1);
+    /*
+     * ESP32-S3 erratum LCD-239 requires more than two LCD_CLK cycles before
+     * I8080 data when PCLK uses LCD_CLK directly.  Two command cycles plus
+     * one dummy cycle give ahead_cycle=3.  The duplicated 0x03 command keeps
+     * D1=CSb and D0=MOSI high throughout this one-time startup preamble.
+     */
+    lcd_ll_set_command(dev, 8, 0x0303U);
+    lcd_ll_set_phase_cycles(dev, 2, 1, 1);
     lcd_ll_set_blank_cycles(dev, 0, 0);
     lcd_ll_enable_output_always_on(dev, true);
     PERIPH_RCC_ATOMIC() {
@@ -503,6 +511,7 @@ esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
     lcd_ll_start(s_waveform.lcd_hal.dev);
     esp_rom_delay_us(2);
     if (s_waveform.fatal) {
+        stim_waveform_deinit();
         return ESP_FAIL;
     }
     ESP_LOGI(TAG,
@@ -571,6 +580,15 @@ void stim_waveform_enter_safe_state(void)
     gpio_set_level(STIM_CSB_GPIO, 1);
     s_waveform.fatal = true;
     s_waveform.state = STIM_WAVEFORM_FAULT;
+}
+
+void stim_waveform_deinit(void)
+{
+    stim_waveform_enter_safe_state();
+    stim_waveform_release_dma();
+    s_waveform.event_callback = NULL;
+    s_waveform.event_user_data = NULL;
+    s_waveform.initialized = false;
 }
 
 void stim_waveform_get_status(stim_waveform_status_t *status)
