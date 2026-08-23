@@ -26,6 +26,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "raw_sd_segment_recorder.h"
+#include "stim_controller.h"
 
 static const char *TAG = "ADC_SD_LOGGER";
 
@@ -979,6 +980,15 @@ void app_main(void)
              "do not format the card in Windows");
     ESP_LOGI(TAG,
              "Raw SD layout: metadata LBA0..2047, data starts LBA2048, capacity=1 GiB");
+
+    const esp_err_t stimulus_result = stim_controller_init();
+    if (stimulus_result != ESP_OK) {
+        ESP_LOGE(TAG,
+                 "Stimulus port initialization failed: 0x%x (%s); "
+                 "continuing ADC/SD capture",
+                 (unsigned int)stimulus_result,
+                 esp_err_to_name(stimulus_result));
+    }
 
     recording_mutex = xSemaphoreCreateMutex();
     dma_stopped_sem = xSemaphoreCreateBinary();

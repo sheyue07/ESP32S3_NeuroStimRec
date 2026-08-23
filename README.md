@@ -1,5 +1,38 @@
 # ESP32-S3 30 MHz ADC Stream Logger
 
+## FPGA 刺激端口（方案 A）
+
+本工程在不改变 ADC/SD 采集链路的前提下，增加独立的 FPGA 刺激端口：
+
+- GPIO19：`mclkST`，连续 6.600 MHz；
+- GPIO8：`SCLK`，连续 6.600 MHz，与 GPIO19 精确反相；
+- GPIO17：`MOSI`，在 SCLK 下降沿附近更新；
+- GPIO15：`CSb`，低有效，每帧低 40 个时钟、随后高 61 个时钟；
+- GPIO6：刺激使能输入，内部下拉，连续稳定 100 µs 后才接受电平变化；
+- GPIO7：仍只用于 ADC/SD 记录开关，连续稳定 200 ms，职责未改变。
+
+波形由 LCD_CAM 8-bit 并行发送端和循环 AHB GDMA 产生。DMA byte 仅使用
+bit0（MOSI）和 bit1（CSb）；bit7:2 恒为 0。LCD 时钟源固定为 PLL160，
+分频为 `24 + 8/33`，PCLK 分频为 1，目标输出恰为 6.600 MHz。
+
+GPIO6 低电平时循环输出 STOP/IDLE slot；稳定变高后只发送一次规范规定的
+10 个 5-byte 配置帧，再进入 ENABLED_IDLE；稳定变低时先完成当前 101-clock
+slot，再返回 STOP_LOOP。常态 STOP/IDLE 循环不会产生逐帧中断，避免给现有
+30 Mbit/s ADC 采集增加持续 CPU 负担。
+
+刺激 GDMA 初始化或运行失败时，GPIO15/17 被切回 GPIO 输出并保持高电平，
+错误只记录到日志；ADC/SPI2、PSRAM ring、帧同步和 SDMMC 任务仍继续运行。
+
+### 刺激端口硬件验收
+
+构建通过只代表软件可编译，烧录后还必须完成以下实测：
+
+1. 示波器确认 GPIO8 为 6.600 MHz，GPIO19 与其反相；
+2. 确认每个配置 slot 为 CSb 低 40 clocks、高 61 clocks，数据 MSB first；
+3. 测量 GPIO6 稳定沿到 slot 边界切换的延迟；
+4. 刺激输出和 30 MHz ADC/SD 同时运行至少 30 分钟，检查 DMA、PSRAM、SD
+   无新增错误或溢出。
+
 本项目使用 ESP32-S3 在外部 30 MHz 时钟下接收 ADC 串行数据，经 GDMA、PSRAM 环形缓冲区和帧同步器持续写入 SD 卡。
 
 ## 硬件与数据格式
