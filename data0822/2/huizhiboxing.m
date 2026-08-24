@@ -24,7 +24,7 @@ sd_channel0 = double(sd_capture.data_SD(1, :));
 
 figure('Name', '标准数据', 'NumberTitle', 'off');
 plot(1:numel(standard_channel0), standard_channel0, 'b-');
-title('标准数据');
+title('标准数据', 'FontSize', 16, 'FontWeight', 'bold');
 xlabel('采样点');
 ylabel('ADC 原始值');
 grid on;
@@ -32,7 +32,7 @@ axis tight;
 
 figure('Name', 'SD数据', 'NumberTitle', 'off');
 plot(1:numel(sd_channel0), sd_channel0, 'r-');
-title('SD数据');
+title('SD数据', 'FontSize', 16, 'FontWeight', 'bold');
 xlabel('采样点');
 ylabel('ADC 原始值');
 grid on;
