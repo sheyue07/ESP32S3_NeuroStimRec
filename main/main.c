@@ -39,7 +39,6 @@ static const char *TAG = "ADC_SD_LOGGER";
 #define FRAME_BATCH_FRAMES          125U
 #define FRAME_BATCH_SIZE            (FRAME_BATCH_FRAMES * ADC_FRAME_SIZE_BYTES)
 #define WRITE_CHUNK_SIZE            (64U * 1024U)
-#define MAX_RECORD_FRAMES           UINT64_C(4129776)
 #define RATE_LOG_INTERVAL_US        UINT64_C(1000000)
 #define CAPTURE_STOP_TIMEOUT_MS     5000
 #define SYNC_EVENT_CAPACITY \
@@ -97,6 +96,7 @@ static void *frame_sync_workspace;
 static raw_sd_sync_event_t *sync_event_storage;
 static uint32_t sync_event_count;
 static uint32_t sync_event_overflow;
+static uint64_t max_record_frames;
 
 static void reset_capture_status(void)
 {
@@ -330,7 +330,7 @@ static bool validated_frame_callback(
         !flush_parser_batch(context)) {
         return false;
     }
-    if (context->total_frames >= MAX_RECORD_FRAMES) {
+    if (context->total_frames >= max_record_frames) {
         /* Reaching the complete-frame file limit is a normal stop condition. */
         return true;
     }
@@ -354,7 +354,7 @@ static void publish_parser_progress(const parser_output_context_t *context)
 {
     xSemaphoreTake(recording_mutex, portMAX_DELAY);
     capture_status.accepted_frames = context->total_frames;
-    if (context->total_frames >= MAX_RECORD_FRAMES) {
+    if (context->total_frames >= max_record_frames) {
         capture_status.limit_reached = true;
     }
     xSemaphoreGive(recording_mutex);
@@ -627,7 +627,8 @@ static bool finish_recording(recording_context_t *context, const char *reason)
             size_t consumed = 0;
             const append_result_t result = append_to_write_cache(
                 context, (const uint8_t *)item, item_size, &consumed);
-            if (result == APPEND_IO_ERROR || consumed != item_size) {
+            if (result == APPEND_IO_ERROR ||
+                (result == APPEND_OK && consumed != item_size)) {
                 drain_ok = false;
             }
         }
@@ -873,7 +874,8 @@ static void sd_write_task(void *parameter)
                 ESP_LOGW(TAG, "Discarded %" PRIu64 " stale bytes", stale_bytes);
             }
             if (raw_sd_recorder_run_is_full(&raw_recorder)) {
-                ESP_LOGW(TAG, "1 GiB raw SD run limit reached; power-cycle to overwrite");
+                ESP_LOGW(TAG,
+                         "Raw SD data capacity reached; power-cycle to overwrite");
                 start_armed = false;
                 continue;
             }
@@ -927,7 +929,7 @@ static void sd_write_task(void *parameter)
         }
         if (status.limit_reached) {
             stop_pipeline_drain_and_finish(
-                &context, "complete-frame 1 GiB limit reached");
+                &context, "complete-frame raw SD capacity reached");
             currently_recording = false;
             continue;
         }
@@ -943,7 +945,7 @@ static void sd_write_task(void *parameter)
 
             if (append_result == APPEND_FILE_LIMIT) {
                 stop_pipeline_drain_and_finish(
-                    &context, "complete-frame 1 GiB limit reached");
+                    &context, "complete-frame raw SD capacity reached");
                 currently_recording = false;
                 continue;
             }
@@ -979,7 +981,8 @@ void app_main(void)
              "DEDICATED RAW SD MODE: LBA0/LBA1 and the raw data area will be overwritten; "
              "do not format the card in Windows");
     ESP_LOGI(TAG,
-             "Raw SD layout: metadata LBA0..2047, data starts LBA2048, capacity=1 GiB");
+             "Raw SD layout: metadata LBA0..2047, data starts LBA2048, "
+             "capacity uses the rest of the card");
 
     const esp_err_t stimulus_result = stim_controller_init();
     if (stimulus_result != ESP_OK) {
@@ -1063,6 +1066,9 @@ void app_main(void)
         raw_sd_recorder_deinit(&raw_recorder);
         return;
     }
+    max_record_frames = raw_sd_recorder_max_valid_frames(&raw_recorder);
+    ESP_LOGI(TAG, "Raw SD complete-frame capacity=%" PRIu64,
+             max_record_frames);
 
     result = continuous_rx_init();
     if (result != ESP_OK) {

@@ -13,6 +13,8 @@ extern "C" {
 #endif
 
 #define RAW_SD_RECORDER_WRITE_BUFFER_BYTES (64U * 1024U)
+#define RAW_SD_ERASE_MARGIN_BYTES (UINT64_C(4) * 1024U * 1024U)
+#define RAW_SD_ERASE_FALLBACK_AU_BYTES (UINT64_C(4) * 1024U * 1024U)
 
 typedef struct {
     raw_sd_capture_outcome_t outcome;
@@ -37,6 +39,7 @@ typedef struct {
     uint64_t active_pending_valid_bytes;
     uint32_t active_directory_lba;
     uint64_t next_write_lba;
+    uint64_t data_capacity_sectors;
     bool card_initialized;
     bool segment_open;
     bool run_full;
@@ -55,6 +58,7 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
                                         esp_err_t failure_code,
                                         const raw_sd_segment_diagnostics_t *diagnostics);
 bool raw_sd_recorder_run_is_full(const raw_sd_recorder_t *recorder);
+uint64_t raw_sd_recorder_max_valid_frames(const raw_sd_recorder_t *recorder);
 
 #ifdef __cplusplus
 }

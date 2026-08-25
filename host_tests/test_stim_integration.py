@@ -12,15 +12,11 @@ CAPTURE_FILES = (
     "continuous_rx.h",
     "frame_sync.c",
     "frame_sync.h",
-    "raw_sd_segment_recorder.c",
-    "raw_sd_segment_recorder.h",
-    "raw_sd_segment_format.c",
-    "raw_sd_segment_format.h",
 )
 
 
 class StimIntegrationTests(unittest.TestCase):
-    def test_adc_and_raw_sd_implementation_files_are_unchanged(self):
+    def test_adc_capture_implementation_files_are_unchanged(self):
         paths = [str(Path("main") / name) for name in CAPTURE_FILES]
         result = subprocess.run(
             ["git", "diff", "--exit-code", "b7f3247", "--", *paths],
@@ -51,7 +47,7 @@ class StimIntegrationTests(unittest.TestCase):
         self.assertIn("GPIO_NUM_8", header)
         self.assertIn("GPIO_NUM_17", header)
         self.assertIn("GPIO_NUM_15", header)
-        self.assertIn("GPIO_NUM_6", controller)
+        self.assertIn("GPIO_NUM_5", controller)
         self.assertIn("LCD_CLK_SRC_PLL160M", source)
         self.assertRegex(source, r"lcd_ll_set_group_clock_coeff\([^;]+12\s*,\s*33\s*,\s*4\s*\)")
         self.assertRegex(source, r"lcd_ll_set_pixel_clock_prescale\([^;]+2\s*\)")
@@ -81,7 +77,7 @@ class StimIntegrationTests(unittest.TestCase):
         for forbidden in ("spi3_host", "gptimer", "ledc_"):
             self.assertNotIn(forbidden, text)
 
-    def test_gpio6_debounce_is_event_driven_and_100us(self):
+    def test_gpio5_debounce_is_event_driven_and_100us(self):
         text = (MAIN / "stim_controller.c").read_text(encoding="utf-8")
         self.assertRegex(text, r"STIM_DEBOUNCE_US\s+100U")
         self.assertIn("GPIO_INTR_ANYEDGE", text)

@@ -22,14 +22,35 @@ static const char *TAG = "RAW_SD_REC";
 #define SDMMC_MAX_FREQ_KHZ 20000
 #define RAW_SD_RECORDER_SECTORS_PER_WRITE \
     (RAW_SD_RECORDER_WRITE_BUFFER_BYTES / RAW_SD_SECTOR_BYTES)
-#define RAW_SD_MAX_VALID_BYTES \
-    (((uint64_t)RAW_SD_DATA_CAPACITY_SECTORS * RAW_SD_SECTOR_BYTES / \
-      RAW_SD_FRAME_BYTES) * RAW_SD_FRAME_BYTES)
 
 _Static_assert(RAW_SD_RECORDER_WRITE_BUFFER_BYTES % RAW_SD_SECTOR_BYTES == 0U,
                "write buffer must contain whole sectors");
 _Static_assert(RAW_SD_FRAME_BYTES == ADC_FRAME_SIZE_BYTES,
                "raw SD frame size must match the stream parser");
+
+static uint64_t data_end_lba(const raw_sd_recorder_t *recorder)
+{
+    return RAW_SD_DATA_START_LBA + recorder->data_capacity_sectors;
+}
+
+static uint64_t max_valid_bytes(const raw_sd_recorder_t *recorder)
+{
+    return recorder->data_capacity_sectors * RAW_SD_SECTOR_BYTES /
+        RAW_SD_FRAME_BYTES * RAW_SD_FRAME_BYTES;
+}
+
+static uint64_t round_up_u64(uint64_t value, uint64_t alignment)
+{
+    if (alignment <= 1U) {
+        return value;
+    }
+    const uint64_t remainder = value % alignment;
+    if (remainder == 0U) {
+        return value;
+    }
+    const uint64_t increment = alignment - remainder;
+    return value <= UINT64_MAX - increment ? value + increment : UINT64_MAX;
+}
 
 static esp_err_t write_superblocks(raw_sd_recorder_t *recorder)
 {
@@ -46,6 +67,199 @@ static esp_err_t write_superblocks(raw_sd_recorder_t *recorder)
                                RAW_SD_SUPERBLOCK_LBA_B, 1U);
 }
 
+static bool previous_superblock_usable(
+    const raw_sd_recorder_t *recorder,
+    const raw_sd_superblock_t *superblock,
+    uint64_t *end_lba)
+{
+    if (!raw_sd_superblock_is_valid(superblock) ||
+        superblock->data_start_lba != RAW_SD_DATA_START_LBA ||
+        superblock->data_capacity_sectors == 0U) {
+        return false;
+    }
+    const uint64_t previous_capacity_end =
+        (uint64_t)superblock->data_start_lba +
+        superblock->data_capacity_sectors;
+    const uint64_t physical_sectors =
+        (superblock->physical_bytes_written + RAW_SD_SECTOR_BYTES - 1U) /
+        RAW_SD_SECTOR_BYTES;
+    const uint64_t physical_end =
+        (uint64_t)superblock->data_start_lba + physical_sectors;
+    uint64_t selected_end = superblock->next_write_lba;
+    if (physical_end > selected_end) {
+        selected_end = physical_end;
+    }
+    if (selected_end < RAW_SD_DATA_START_LBA ||
+        selected_end > previous_capacity_end ||
+        selected_end > (uint64_t)recorder->card.csd.capacity) {
+        return false;
+    }
+    *end_lba = selected_end;
+    return true;
+}
+
+static esp_err_t load_previous_run_end(
+    raw_sd_recorder_t *recorder,
+    uint64_t *previous_end_lba,
+    bool *previous_incomplete,
+    bool *found)
+{
+    raw_sd_superblock_t copy_a = {0};
+    raw_sd_superblock_t copy_b = {0};
+    esp_err_t read_a = sdmmc_read_sectors(
+        &recorder->card, recorder->write_buffer,
+        RAW_SD_SUPERBLOCK_LBA_A, 1U);
+    if (read_a == ESP_OK) {
+        memcpy(&copy_a, recorder->write_buffer, sizeof(copy_a));
+    } else {
+        ESP_LOGW(TAG, "Previous superblock A read failed: 0x%x (%s)",
+                 (unsigned int)read_a, esp_err_to_name(read_a));
+    }
+    esp_err_t read_b = sdmmc_read_sectors(
+        &recorder->card, recorder->write_buffer,
+        RAW_SD_SUPERBLOCK_LBA_B, 1U);
+    if (read_b == ESP_OK) {
+        memcpy(&copy_b, recorder->write_buffer, sizeof(copy_b));
+    } else {
+        ESP_LOGW(TAG, "Previous superblock B read failed: 0x%x (%s)",
+                 (unsigned int)read_b, esp_err_to_name(read_b));
+    }
+    if (read_a != ESP_OK && read_b != ESP_OK) {
+        return read_a;
+    }
+
+    uint64_t end_a = 0U;
+    uint64_t end_b = 0U;
+    const bool valid_a = read_a == ESP_OK &&
+        previous_superblock_usable(recorder, &copy_a, &end_a);
+    const bool valid_b = read_b == ESP_OK &&
+        previous_superblock_usable(recorder, &copy_b, &end_b);
+    if (!valid_a && !valid_b) {
+        *found = false;
+        return ESP_OK;
+    }
+
+    const raw_sd_superblock_t *selected = &copy_a;
+    uint64_t selected_end = end_a;
+    if (!valid_a || (valid_b &&
+        (copy_b.generation > copy_a.generation ||
+         (copy_b.generation == copy_a.generation && end_b > end_a)))) {
+        selected = &copy_b;
+        selected_end = end_b;
+    }
+    *previous_end_lba = selected_end;
+    *previous_incomplete = false;
+    if (selected->segment_count > RAW_SD_SEGMENT_DIRECTORY_CAPACITY) {
+        *previous_incomplete = true;
+    } else if (selected->segment_count > 0U) {
+        raw_sd_segment_t last_segment = {0};
+        const uint32_t last_segment_lba =
+            RAW_SD_SEGMENT_DIRECTORY_START_LBA +
+            selected->segment_count - 1U;
+        const esp_err_t segment_read = sdmmc_read_sectors(
+            &recorder->card, recorder->write_buffer,
+            last_segment_lba, 1U);
+        if (segment_read == ESP_OK) {
+            memcpy(&last_segment, recorder->write_buffer,
+                   sizeof(last_segment));
+        }
+        const uint64_t segment_end_lba = last_segment.start_lba +
+            (last_segment.physical_bytes + RAW_SD_SECTOR_BYTES - 1U) /
+            RAW_SD_SECTOR_BYTES;
+        if (segment_read != ESP_OK ||
+            !raw_sd_segment_is_valid(&last_segment) ||
+            last_segment.run_id != selected->run_id ||
+            last_segment.segment_id != selected->segment_count ||
+            last_segment.metadata_generation > selected->generation ||
+            (last_segment.state != RAW_SD_SEGMENT_CLOSED &&
+             last_segment.state != RAW_SD_SEGMENT_FAILED) ||
+            segment_end_lba != selected_end) {
+            *previous_incomplete = true;
+        }
+    }
+    *found = true;
+    ESP_LOGI(TAG,
+             "Previous run metadata: generation=%" PRIu32
+             ", end_lba=%" PRIu64 ", physical=%" PRIu64 " bytes",
+             selected->generation, selected_end,
+             selected->physical_bytes_written);
+    return ESP_OK;
+}
+
+static esp_err_t prepare_previous_run_range(raw_sd_recorder_t *recorder)
+{
+    uint64_t previous_end_lba = 0U;
+    bool previous_incomplete = false;
+    bool found = false;
+    esp_err_t result = load_previous_run_end(
+        recorder, &previous_end_lba, &previous_incomplete, &found);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (!found) {
+        ESP_LOGW(TAG,
+                 "No valid previous raw-SD metadata; targeted pre-erase skipped");
+        return ESP_OK;
+    }
+    if (previous_incomplete) {
+        ESP_LOGW(TAG,
+                 "Previous run did not close normally; recorded end LBA may be stale");
+    }
+
+    uint64_t allocation_unit_bytes =
+        (uint64_t)recorder->card.ssr.alloc_unit_kb * 1024U;
+    if (allocation_unit_bytes < RAW_SD_SECTOR_BYTES) {
+        allocation_unit_bytes = RAW_SD_ERASE_FALLBACK_AU_BYTES;
+        ESP_LOGW(TAG,
+                 "Card did not report Allocation Unit; using %" PRIu64
+                 " MiB fallback",
+                 allocation_unit_bytes / (1024U * 1024U));
+    }
+    const uint64_t allocation_unit_sectors =
+        allocation_unit_bytes / RAW_SD_SECTOR_BYTES;
+    const uint64_t erase_margin_sectors =
+        RAW_SD_ERASE_MARGIN_BYTES / RAW_SD_SECTOR_BYTES;
+    const uint64_t card_end_lba = (uint64_t)recorder->card.csd.capacity;
+    uint64_t requested_end_lba = previous_end_lba;
+    if (erase_margin_sectors <= card_end_lba &&
+        requested_end_lba <= card_end_lba - erase_margin_sectors) {
+        requested_end_lba += erase_margin_sectors;
+    } else {
+        requested_end_lba = card_end_lba;
+    }
+    requested_end_lba = round_up_u64(
+        requested_end_lba, allocation_unit_sectors);
+    if (requested_end_lba > card_end_lba) {
+        requested_end_lba = card_end_lba;
+    }
+    if (requested_end_lba > SIZE_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    const uint64_t previous_used_sectors =
+        previous_end_lba - RAW_SD_DATA_START_LBA;
+    ESP_LOGI(TAG,
+             "Pre-erasing previous raw range: used=%" PRIu64
+             " MiB, AU=%" PRIu64 " KiB, erase=LBA0..%" PRIu64
+             " (%" PRIu64 " MiB)",
+             previous_used_sectors * RAW_SD_SECTOR_BYTES / (1024U * 1024U),
+             allocation_unit_bytes / 1024U,
+             requested_end_lba - 1U,
+             requested_end_lba * RAW_SD_SECTOR_BYTES / (1024U * 1024U));
+    const int64_t erase_start_us = esp_timer_get_time();
+    result = sdmmc_erase_sectors(
+        &recorder->card, 0U, (size_t)requested_end_lba,
+        SDMMC_ERASE_ARG);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Raw range pre-erase failed: 0x%x (%s)",
+                 (unsigned int)result, esp_err_to_name(result));
+        return result;
+    }
+    ESP_LOGI(TAG, "Raw range pre-erase completed in %" PRIi64 " ms",
+             (esp_timer_get_time() - erase_start_us) / 1000);
+    return ESP_OK;
+}
+
 static esp_err_t write_active_segment(raw_sd_recorder_t *recorder)
 {
     raw_sd_segment_finalize(&recorder->active_segment);
@@ -60,8 +274,7 @@ static esp_err_t write_data_block(raw_sd_recorder_t *recorder,
         return ESP_ERR_INVALID_ARG;
     }
     const uint64_t sectors = bytes / RAW_SD_SECTOR_BYTES;
-    const uint64_t data_end_lba = RAW_SD_DATA_START_LBA + RAW_SD_DATA_CAPACITY_SECTORS;
-    if (recorder->next_write_lba + sectors > data_end_lba) {
+    if (recorder->next_write_lba + sectors > data_end_lba(recorder)) {
         return ESP_ERR_INVALID_SIZE;
     }
     const esp_err_t result = sdmmc_write_sectors(&recorder->card, data,
@@ -81,12 +294,13 @@ static esp_err_t flush_full_buffer(raw_sd_recorder_t *recorder)
     if (recorder->write_buffer_used != RAW_SD_RECORDER_WRITE_BUFFER_BYTES) {
         return ESP_OK;
     }
-    const esp_err_t result = write_data_block(recorder, recorder->write_buffer,
-                                               recorder->write_buffer_used);
-    if (result == ESP_OK) {
-        recorder->write_buffer_used = 0U;
+    esp_err_t result = write_data_block(recorder, recorder->write_buffer,
+                                        recorder->write_buffer_used);
+    if (result != ESP_OK) {
+        return result;
     }
-    return result;
+    recorder->write_buffer_used = 0U;
+    return ESP_OK;
 }
 
 static esp_err_t flush_tail(raw_sd_recorder_t *recorder)
@@ -99,12 +313,13 @@ static esp_err_t flush_tail(raw_sd_recorder_t *recorder)
         RAW_SD_SECTOR_BYTES * RAW_SD_SECTOR_BYTES;
     memset(recorder->write_buffer + recorder->write_buffer_used, 0,
            physical_bytes - recorder->write_buffer_used);
-    const esp_err_t result = write_data_block(recorder, recorder->write_buffer,
-                                               physical_bytes);
-    if (result == ESP_OK) {
-        recorder->write_buffer_used = 0U;
+    esp_err_t result = write_data_block(recorder, recorder->write_buffer,
+                                        physical_bytes);
+    if (result != ESP_OK) {
+        return result;
     }
-    return result;
+    recorder->write_buffer_used = 0U;
+    return ESP_OK;
 }
 
 esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
@@ -145,10 +360,16 @@ esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
         (void)sdmmc_host_deinit();
         return ESP_ERR_NOT_SUPPORTED;
     }
-    const uint64_t required_sectors = RAW_SD_DATA_START_LBA + RAW_SD_DATA_CAPACITY_SECTORS;
-    if ((uint64_t)recorder->card.csd.capacity < required_sectors) {
-        ESP_LOGE(TAG, "Card too small: sectors=%d required=%" PRIu64,
-                 recorder->card.csd.capacity, required_sectors);
+    if ((uint64_t)recorder->card.csd.capacity <= RAW_SD_DATA_START_LBA) {
+        ESP_LOGE(TAG, "Card too small: sectors=%d metadata_end=%" PRIu32,
+                 recorder->card.csd.capacity, RAW_SD_DATA_START_LBA);
+        (void)sdmmc_host_deinit();
+        return ESP_ERR_INVALID_SIZE;
+    }
+    recorder->data_capacity_sectors =
+        (uint64_t)recorder->card.csd.capacity - RAW_SD_DATA_START_LBA;
+    if (recorder->data_capacity_sectors > UINT32_MAX) {
+        ESP_LOGE(TAG, "Raw data area exceeds metadata field capacity");
         (void)sdmmc_host_deinit();
         return ESP_ERR_INVALID_SIZE;
     }
@@ -161,6 +382,9 @@ esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
     }
     recorder->card_initialized = true;
     sdmmc_card_print_info(stdout, &recorder->card);
+    ESP_LOGI(TAG, "Raw data capacity after LBA2048: %" PRIu64 " MiB",
+             recorder->data_capacity_sectors * RAW_SD_SECTOR_BYTES /
+                 (1024U * 1024U));
     return ESP_OK;
 }
 
@@ -182,11 +406,16 @@ esp_err_t raw_sd_recorder_begin_run(raw_sd_recorder_t *recorder)
     if (recorder == NULL || !recorder->card_initialized || recorder->segment_open) {
         return ESP_ERR_INVALID_STATE;
     }
+    esp_err_t result = prepare_previous_run_range(recorder);
+    if (result != ESP_OK) {
+        return result;
+    }
     memset(&recorder->superblock, 0, sizeof(recorder->superblock));
     recorder->superblock.state = RAW_SD_RUN_RUNNING;
     recorder->superblock.run_id = 1U;
     recorder->superblock.data_start_lba = RAW_SD_DATA_START_LBA;
-    recorder->superblock.data_capacity_sectors = RAW_SD_DATA_CAPACITY_SECTORS;
+    recorder->superblock.data_capacity_sectors =
+        (uint32_t)recorder->data_capacity_sectors;
     recorder->superblock.directory_capacity =
         RAW_SD_SEGMENT_DIRECTORY_CAPACITY;
     recorder->superblock.event_area_start_lba = RAW_SD_EVENT_AREA_START_LBA;
@@ -245,9 +474,18 @@ esp_err_t raw_sd_recorder_append(raw_sd_recorder_t *recorder,
         length % RAW_SD_FRAME_BYTES != 0U) {
         return ESP_ERR_INVALID_ARG;
     }
-    const uint64_t remaining = RAW_SD_MAX_VALID_BYTES -
-        recorder->superblock.valid_bytes_written -
-        recorder->active_pending_valid_bytes;
+    const uint64_t capacity_bytes =
+        recorder->data_capacity_sectors * RAW_SD_SECTOR_BYTES;
+    if (recorder->superblock.physical_bytes_written > capacity_bytes ||
+        recorder->write_buffer_used >
+            capacity_bytes - recorder->superblock.physical_bytes_written) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint64_t physically_available =
+        capacity_bytes - recorder->superblock.physical_bytes_written -
+        recorder->write_buffer_used;
+    const uint64_t remaining = physically_available /
+        RAW_SD_FRAME_BYTES * RAW_SD_FRAME_BYTES;
     const size_t accepted = length > remaining ? (size_t)remaining : length;
     size_t offset = 0U;
     while (offset < accepted) {
@@ -422,7 +660,7 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
     }
     if (final_state == RAW_SD_SEGMENT_CLOSED &&
         recorder->superblock.physical_bytes_written ==
-            (uint64_t)RAW_SD_DATA_CAPACITY_SECTORS * RAW_SD_SECTOR_BYTES) {
+            recorder->data_capacity_sectors * RAW_SD_SECTOR_BYTES) {
         recorder->run_full = true;
         recorder->superblock.state = RAW_SD_RUN_COMPLETE;
     }
@@ -439,4 +677,10 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
 bool raw_sd_recorder_run_is_full(const raw_sd_recorder_t *recorder)
 {
     return recorder != NULL && recorder->run_full;
+}
+
+uint64_t raw_sd_recorder_max_valid_frames(const raw_sd_recorder_t *recorder)
+{
+    return recorder == NULL ? 0U :
+        max_valid_bytes(recorder) / RAW_SD_FRAME_BYTES;
 }

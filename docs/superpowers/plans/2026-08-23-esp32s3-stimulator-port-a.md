@@ -4,7 +4,7 @@
 
 **目标：** 在现有 ESP32-S3 ADC→PSRAM→SDMMC 连续采集工程中增加独立的 FPGA 刺激端口，同时保持 ADC/SD 采集路径及数据格式不变。
 
-**架构：** 新增三个边界清晰的模块：`stim_protocol` 只负责生成 5-byte 配置帧；`stim_waveform` 负责把帧编译为 LCD_CAM/GDMA 循环波形并驱动 GPIO19/8/17/15；`stim_controller` 负责 GPIO6 的 100 µs 连续稳定消抖和 STOP/START/IDLE 状态控制。刺激模块初始化失败时只报告错误并保持 CSb/MOSI 为高，不中止现有 ADC/SD 初始化。
+**架构：** 新增三个边界清晰的模块：`stim_protocol` 只负责生成 5-byte 配置帧；`stim_waveform` 负责把帧编译为 LCD_CAM/GDMA 循环波形并驱动 GPIO19/8/17/15；`stim_controller` 负责 GPIO5 的 100 µs 连续稳定消抖和 STOP/START/IDLE 状态控制。刺激模块初始化失败时只报告错误并保持 CSb/MOSI 为高，不中止现有 ADC/SD 初始化。
 
 **平台：** ESP-IDF v6.0.2、ESP32-S3、LCD_CAM i80 发送端、AHB GDMA、FreeRTOS、Unity/主机 Python 回归测试。
 
@@ -69,7 +69,7 @@
 6. 注册 GDMA transaction/descriptor error 回调；故障时发布错误事件，GPIO15/17 回到高电平安全态，不影响 ADC 任务。
 7. 用源代码契约测试检查时钟参数、GPIO matrix signal、descriptor 长度与禁止使用 SPI3/GPTimer/LEDC/bit-bang。
 
-## 任务 5：实现 GPIO6 消抖与控制状态机
+## 任务 5：实现 GPIO5 消抖与控制状态机
 
 **文件：**
 
@@ -78,9 +78,9 @@
 - 修改：`main/CMakeLists.txt`
 - 测试：`host_tests/test_stim_integration.py`
 
-1. GPIO6 配置为下拉输入、双边沿中断。
+1. GPIO5 配置为下拉输入、双边沿中断。
 2. GPIO ISR 仅投递 edge event；控制任务收到事件后启动/重启 100 µs one-shot `esp_timer`。
-3. timer callback 仅投递 expiry event；任务重新读取 GPIO6，只有电平在整个窗口未变化才提交状态切换。
+3. timer callback 仅投递 expiry event；任务重新读取 GPIO5，只有电平在整个窗口未变化才提交状态切换。
 4. 高电平只触发一次 10-frame START_SEQUENCE，然后进入 ENABLED_IDLE；低电平回 STOP_LOOP。
 5. 使用静态 queue/task storage；回调不得构造 DMA 数据。
 
@@ -108,5 +108,5 @@
 2. 在已加载 ESP-IDF v6.0.2 环境下运行 `idf.py reconfigure build`。
 3. 检查编译警告、IRAM/DRAM/flash 使用量和 map 中 LCD_CAM/GDMA 依赖。
 4. 对照基线确认 ADC 30 MHz SPI2、GPIO7 开关、SDMMC 4-bit 20 MHz、260-byte 帧和 raw SD layout 未改变。
-5. 输出硬件验收清单：示波器测 GPIO8=6.600 MHz、GPIO19 精确反相、40 low/61 high、GPIO6 切换延迟；ADC+刺激并发连续 30 min，确认 DMA/PSRAM/SD 无新增错误。
+5. 输出硬件验收清单：示波器测 GPIO8=6.600 MHz、GPIO19 精确反相、40 low/61 high、GPIO5 切换延迟；ADC+刺激并发连续 30 min，确认 DMA/PSRAM/SD 无新增错误。
 6. 无真实开发板/示波器结果时明确标记“硬件验证待执行”，不得把构建成功描述成硬件通过。
