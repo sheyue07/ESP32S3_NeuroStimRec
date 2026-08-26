@@ -213,6 +213,9 @@ esp_err_t raw_sd_recorder_begin_run(raw_sd_recorder_t *recorder)
     recorder->next_write_lba = RAW_SD_DATA_START_LBA;
     recorder->write_buffer_used = 0U;
     recorder->run_full = false;
+    ESP_LOGI(TAG,
+             "Startup pre-erase disabled; new eMMC run overwrites from LBA%" PRIu32,
+             RAW_SD_DATA_START_LBA);
     return write_superblocks(recorder);
 }
 
