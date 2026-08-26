@@ -11,25 +11,23 @@
 #include "esp_timer.h"
 #include "frame_sync.h"
 
-static const char *TAG = "RAW_SD_REC";
+static const char *TAG = "RAW_EMMC_REC";
 
-#define SDMMC_PIN_CLK GPIO_NUM_41
-#define SDMMC_PIN_CMD GPIO_NUM_42
-#define SDMMC_PIN_D0 GPIO_NUM_40
-#define SDMMC_PIN_D1 GPIO_NUM_39
-#define SDMMC_PIN_D2 GPIO_NUM_1
-#define SDMMC_PIN_D3 GPIO_NUM_2
-#define SDMMC_MAX_FREQ_KHZ 20000
+/* ESP32-S3 native SDMMC 4-bit connection to the on-board eMMC. */
+#define EMMC_PIN_CLK GPIO_NUM_10
+#define EMMC_PIN_CMD GPIO_NUM_9
+#define EMMC_PIN_D0 GPIO_NUM_13
+#define EMMC_PIN_D1 GPIO_NUM_14
+#define EMMC_PIN_D2 GPIO_NUM_12
+#define EMMC_PIN_D3 GPIO_NUM_11
+#define EMMC_MAX_FREQ_KHZ 20000
 #define RAW_SD_RECORDER_SECTORS_PER_WRITE \
     (RAW_SD_RECORDER_WRITE_BUFFER_BYTES / RAW_SD_SECTOR_BYTES)
-#define RAW_SD_MAX_VALID_BYTES \
-    (((uint64_t)RAW_SD_DATA_CAPACITY_SECTORS * RAW_SD_SECTOR_BYTES / \
-      RAW_SD_FRAME_BYTES) * RAW_SD_FRAME_BYTES)
 
 _Static_assert(RAW_SD_RECORDER_WRITE_BUFFER_BYTES % RAW_SD_SECTOR_BYTES == 0U,
                "write buffer must contain whole sectors");
 _Static_assert(RAW_SD_FRAME_BYTES == ADC_FRAME_SIZE_BYTES,
-               "raw SD frame size must match the stream parser");
+               "raw eMMC frame size must match the stream parser");
 
 static esp_err_t write_superblocks(raw_sd_recorder_t *recorder)
 {
@@ -114,40 +112,58 @@ esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
     }
     memset(recorder, 0, sizeof(*recorder));
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = SDMMC_MAX_FREQ_KHZ;
+    host.max_freq_khz = EMMC_MAX_FREQ_KHZ;
     host.command_timeout_ms = 3000;
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
     slot_config.width = 4;
-    slot_config.clk = SDMMC_PIN_CLK;
-    slot_config.cmd = SDMMC_PIN_CMD;
-    slot_config.d0 = SDMMC_PIN_D0;
-    slot_config.d1 = SDMMC_PIN_D1;
-    slot_config.d2 = SDMMC_PIN_D2;
-    slot_config.d3 = SDMMC_PIN_D3;
+    slot_config.clk = EMMC_PIN_CLK;
+    slot_config.cmd = EMMC_PIN_CMD;
+    slot_config.d0 = EMMC_PIN_D0;
+    slot_config.d1 = EMMC_PIN_D1;
+    slot_config.d2 = EMMC_PIN_D2;
+    slot_config.d3 = EMMC_PIN_D3;
     slot_config.cd = GPIO_NUM_NC;
     slot_config.wp = GPIO_NUM_NC;
+    ESP_LOGI(TAG,
+             "eMMC SDMMC pins: CLK=GPIO%d CMD=GPIO%d D0=GPIO%d D1=GPIO%d "
+             "D2=GPIO%d D3=GPIO%d, width=4, limit=%d kHz",
+             EMMC_PIN_CLK, EMMC_PIN_CMD, EMMC_PIN_D0, EMMC_PIN_D1,
+             EMMC_PIN_D2, EMMC_PIN_D3, EMMC_MAX_FREQ_KHZ);
     esp_err_t result = sdmmc_host_init();
     if (result != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC host initialization failed: 0x%x (%s)",
+                 (unsigned int)result, esp_err_to_name(result));
         return result;
     }
     result = sdmmc_host_init_slot(host.slot, &slot_config);
     if (result != ESP_OK) {
+        ESP_LOGE(TAG, "SDMMC eMMC slot initialization failed: 0x%x (%s)",
+                 (unsigned int)result, esp_err_to_name(result));
         (void)sdmmc_host_deinit();
         return result;
     }
     result = sdmmc_card_init(&host, &recorder->card);
     if (result != ESP_OK) {
+        ESP_LOGE(TAG, "eMMC initialization failed: 0x%x (%s)",
+                 (unsigned int)result, esp_err_to_name(result));
         (void)sdmmc_host_deinit();
         return result;
     }
+    if (!recorder->card.is_mmc) {
+        ESP_LOGE(TAG,
+                 "The detected device is not MMC/eMMC; refusing raw writes");
+        (void)sdmmc_host_deinit();
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     if (recorder->card.csd.sector_size != RAW_SD_SECTOR_BYTES) {
-        ESP_LOGE(TAG, "Unsupported sector size: %d bytes", recorder->card.csd.sector_size);
+        ESP_LOGE(TAG, "Unsupported eMMC sector size: %d bytes",
+                 recorder->card.csd.sector_size);
         (void)sdmmc_host_deinit();
         return ESP_ERR_NOT_SUPPORTED;
     }
     const uint64_t required_sectors = RAW_SD_DATA_START_LBA + RAW_SD_DATA_CAPACITY_SECTORS;
     if ((uint64_t)recorder->card.csd.capacity < required_sectors) {
-        ESP_LOGE(TAG, "Card too small: sectors=%d required=%" PRIu64,
+        ESP_LOGE(TAG, "eMMC user area too small: sectors=%d required=%" PRIu64,
                  recorder->card.csd.capacity, required_sectors);
         (void)sdmmc_host_deinit();
         return ESP_ERR_INVALID_SIZE;
@@ -161,6 +177,8 @@ esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
     }
     recorder->card_initialized = true;
     sdmmc_card_print_info(stdout, &recorder->card);
+    ESP_LOGI(TAG, "eMMC ready: 4-bit SDMMC, actual clock %.2f MHz",
+             (double)recorder->card.real_freq_khz / 1000.0);
     return ESP_OK;
 }
 
@@ -245,9 +263,21 @@ esp_err_t raw_sd_recorder_append(raw_sd_recorder_t *recorder,
         length % RAW_SD_FRAME_BYTES != 0U) {
         return ESP_ERR_INVALID_ARG;
     }
-    const uint64_t remaining = RAW_SD_MAX_VALID_BYTES -
-        recorder->superblock.valid_bytes_written -
-        recorder->active_pending_valid_bytes;
+    /* Capacity must be based on physical bytes. Every closed segment can add
+     * up to one sector of tail padding, so counting valid frame bytes alone
+     * can overrun the fixed 1 GiB raw eMMC data area after many segments. */
+    const uint64_t capacity_bytes =
+        (uint64_t)RAW_SD_DATA_CAPACITY_SECTORS * RAW_SD_SECTOR_BYTES;
+    if (recorder->superblock.physical_bytes_written > capacity_bytes ||
+        recorder->write_buffer_used >
+            capacity_bytes - recorder->superblock.physical_bytes_written) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint64_t physically_available =
+        capacity_bytes - recorder->superblock.physical_bytes_written -
+        recorder->write_buffer_used;
+    const uint64_t remaining = physically_available /
+        RAW_SD_FRAME_BYTES * RAW_SD_FRAME_BYTES;
     const size_t accepted = length > remaining ? (size_t)remaining : length;
     size_t offset = 0U;
     while (offset < accepted) {

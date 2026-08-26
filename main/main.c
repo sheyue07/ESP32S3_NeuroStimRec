@@ -1,10 +1,10 @@
 /*
- * ESP32-S3 30 MHz external-clock ADC stream to TF-card logger.
+ * ESP32-S3 30 MHz external-clock ADC stream to raw eMMC logger.
  *
  * GPIO20 external clock + GPIO16 serial data (rising-edge sample, MSB first)
  * -> SPI2/GDMA cyclic internal buffers -> 2 MiB raw PSRAM ring
  * -> byte-oriented 260-byte frame synchronizer -> 12 MiB valid PSRAM ring
- * -> 64 KiB SDMMC DMA cache -> raw SD-card segmented data region.
+ * -> 64 KiB SDMMC DMA cache -> raw eMMC user-area segmented data region.
  */
 
 #include <inttypes.h>
@@ -28,7 +28,7 @@
 #include "raw_sd_segment_recorder.h"
 #include "stim_controller.h"
 
-static const char *TAG = "ADC_SD_LOGGER";
+static const char *TAG = "ADC_EMMC_LOGGER";
 
 #define RECORD_SWITCH_GPIO          GPIO_NUM_7
 #define SWITCH_DEBOUNCE_MS          200
@@ -138,7 +138,7 @@ static void signal_capture_failure(const char *operation, esp_err_t error)
              (unsigned int)error, esp_err_to_name(error));
 }
 
-static esp_err_t init_sdmmc_4bit(void)
+static esp_err_t init_emmc_4bit(void)
 {
     return raw_sd_recorder_init(&raw_recorder);
 }
@@ -176,7 +176,7 @@ static bool open_raw_segment(recording_context_t *context)
     sync_event_overflow = 0U;
     const esp_err_t result = raw_sd_recorder_open_segment(&raw_recorder);
     if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open raw SD segment: 0x%x (%s)",
+        ESP_LOGE(TAG, "Failed to open raw eMMC segment: 0x%x (%s)",
                  (unsigned int)result, esp_err_to_name(result));
         return false;
     }
@@ -584,7 +584,7 @@ static bool stop_pipeline_drain_and_finish(recording_context_t *context,
         const append_result_t drain_result =
             drain_valid_ring(context, pdMS_TO_TICKS(10));
         if (drain_result == APPEND_IO_ERROR) {
-            signal_capture_failure("TF write while draining", ESP_FAIL);
+            signal_capture_failure("eMMC write while draining", ESP_FAIL);
             wait_failed = true;
         }
     }
@@ -627,7 +627,8 @@ static bool finish_recording(recording_context_t *context, const char *reason)
             size_t consumed = 0;
             const append_result_t result = append_to_write_cache(
                 context, (const uint8_t *)item, item_size, &consumed);
-            if (result == APPEND_IO_ERROR || consumed != item_size) {
+            if (result == APPEND_IO_ERROR ||
+                (result == APPEND_OK && consumed != item_size)) {
                 drain_ok = false;
             }
         }
@@ -690,7 +691,7 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     if (metadata_result != ESP_OK) {
         success = false;
         outcome = RAW_SD_CAPTURE_FAILED_PIPELINE;
-        ESP_LOGE(TAG, "Raw SD segment metadata update failed: 0x%x (%s)",
+        ESP_LOGE(TAG, "Raw eMMC segment metadata update failed: 0x%x (%s)",
                  (unsigned int)metadata_result,
                  esp_err_to_name(metadata_result));
     }
@@ -708,7 +709,7 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     if (confirmed_valid_bytes != valid_bytes) {
         ESP_LOGW(TAG,
                  "Accepted=%" PRIu64 ", but only %" PRIu64
-                 " complete-frame bytes were confirmed on SD",
+                 " complete-frame bytes were confirmed on eMMC",
                  valid_bytes, confirmed_valid_bytes);
     }
     ESP_LOGI(TAG,
@@ -763,17 +764,17 @@ static void log_write_rate(recording_context_t *context,
     const double valid_rate =
         ((double)(valid_delta_frames * ADC_FRAME_SIZE_BYTES) /
          (1024.0 * 1024.0)) / seconds;
-    const double sd_rate =
+    const double emmc_rate =
         ((double)physical_delta / (1024.0 * 1024.0)) / seconds;
 
     ESP_LOGI(TAG,
-             "ADC=%.2f MiB/s | Valid=%.2f MiB/s | SD=%.2f MiB/s"
+             "ADC=%.2f MiB/s | Valid=%.2f MiB/s | eMMC=%.2f MiB/s"
              " | Sync=%s | Candidates=%u | Uncertain=%s"
              " | frames=%" PRIu64 " | valid=%" PRIu64
              " | raw_free=%zu | valid_free=%zu | dma_overrun=%" PRIu64
              " | DMA_seq=%" PRIu64 " | raw_overflow=%" PRIu64
              ", valid_overflow=%" PRIu64,
-             adc_rate, valid_rate, sd_rate,
+             adc_rate, valid_rate, emmc_rate,
              frame_sync_state_name(sync_status.state),
              sync_status.state == FRAME_SYNC_LOCKED
                  ? sync_status.last_lock_candidates
@@ -821,7 +822,7 @@ static bool gpio7_level_is_stable(bool expected_high)
     return (gpio_get_level(RECORD_SWITCH_GPIO) == 1) == expected_high;
 }
 
-static void sd_write_task(void *parameter)
+static void emmc_write_task(void *parameter)
 {
     (void)parameter;
 
@@ -873,7 +874,7 @@ static void sd_write_task(void *parameter)
                 ESP_LOGW(TAG, "Discarded %" PRIu64 " stale bytes", stale_bytes);
             }
             if (raw_sd_recorder_run_is_full(&raw_recorder)) {
-                ESP_LOGW(TAG, "1 GiB raw SD run limit reached; power-cycle to overwrite");
+                ESP_LOGW(TAG, "1 GiB raw eMMC run limit reached; power-cycle to overwrite");
                 start_armed = false;
                 continue;
             }
@@ -948,9 +949,9 @@ static void sd_write_task(void *parameter)
                 continue;
             }
             if (append_result == APPEND_IO_ERROR || consumed != item_size) {
-                signal_capture_failure("raw SD write/cache", ESP_FAIL);
+                signal_capture_failure("raw eMMC write/cache", ESP_FAIL);
                 stop_pipeline_drain_and_finish(
-                    &context, "raw SD card write failure");
+                    &context, "raw eMMC write failure");
                 currently_recording = false;
                 continue;
             }
@@ -976,16 +977,17 @@ void app_main(void)
              ADC_FRAME_SIZE_BYTES,
              ADC_FRAME_SIZE_BITS);
     ESP_LOGW(TAG,
-             "DEDICATED RAW SD MODE: LBA0/LBA1 and the raw data area will be overwritten; "
-             "do not format the card in Windows");
+             "DEDICATED RAW eMMC MODE: eMMC user-area LBA0/LBA1 and the raw "
+             "data area will be overwritten");
     ESP_LOGI(TAG,
-             "Raw SD layout: metadata LBA0..2047, data starts LBA2048, capacity=1 GiB");
+             "Raw eMMC user-area layout: metadata LBA0..2047, data starts "
+             "LBA2048, capacity=1 GiB");
 
     const esp_err_t stimulus_result = stim_controller_init();
     if (stimulus_result != ESP_OK) {
         ESP_LOGE(TAG,
                  "Stimulus port initialization failed: 0x%x (%s); "
-                 "continuing ADC/SD capture",
+                 "continuing ADC/eMMC capture",
                  (unsigned int)stimulus_result,
                  esp_err_to_name(stimulus_result));
     }
@@ -1052,13 +1054,13 @@ void app_main(void)
     frame_sync_set_event_callback(
         &stream_sync, frame_sync_event_callback, NULL);
 
-    esp_err_t result = init_sdmmc_4bit();
+    esp_err_t result = init_emmc_4bit();
     if (result != ESP_OK) {
         return;
     }
     result = raw_sd_recorder_begin_run(&raw_recorder);
     if (result != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize raw SD run: 0x%x (%s)",
+        ESP_LOGE(TAG, "Failed to initialize raw eMMC run: 0x%x (%s)",
                  (unsigned int)result, esp_err_to_name(result));
         raw_sd_recorder_deinit(&raw_recorder);
         return;
@@ -1075,7 +1077,7 @@ void app_main(void)
              CONTINUOUS_RX_BLOCK_COUNT, CONTINUOUS_RX_BLOCK_SIZE);
     ESP_LOGI(TAG,
              "FreeRTOS pipeline: DMA(CPU0/P20) -> raw 2 MiB -> "
-             "parser(CPU0/P10) -> valid 12 MiB -> SD(CPU1/P6)");
+             "parser(CPU0/P10) -> valid 12 MiB -> eMMC(CPU1/P6)");
 
     parser_batch_storage = heap_caps_malloc(
         FRAME_BATCH_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1115,14 +1117,14 @@ void app_main(void)
     }
 
     if (xTaskCreatePinnedToCore(
-            sd_write_task,
-            "SD_WRITE_TASK",
+            emmc_write_task,
+            "EMMC_WRITE_TASK",
             8192,
             NULL,
             6,
             NULL,
             1) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create SD write task");
+        ESP_LOGE(TAG, "Failed to create eMMC write task");
         vTaskDelete(parser_task_handle);
         parser_task_handle = NULL;
         vTaskDelete(dma_task_handle);
