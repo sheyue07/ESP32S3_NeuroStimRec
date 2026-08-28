@@ -10,17 +10,19 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "frame_sync.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "RAW_EMMC_REC";
 
 /* ESP32-S3 native SDMMC 4-bit connection to the on-board eMMC. */
-#define EMMC_PIN_CLK GPIO_NUM_10
-#define EMMC_PIN_CMD GPIO_NUM_9
-#define EMMC_PIN_D0 GPIO_NUM_13
-#define EMMC_PIN_D1 GPIO_NUM_14
-#define EMMC_PIN_D2 GPIO_NUM_12
-#define EMMC_PIN_D3 GPIO_NUM_11
-#define EMMC_MAX_FREQ_KHZ 20000
+#define EMMC_PIN_CLK ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_CLK_GPIO)
+#define EMMC_PIN_CMD ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_CMD_GPIO)
+#define EMMC_PIN_D0  ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_D0_GPIO)
+#define EMMC_PIN_D1  ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_D1_GPIO)
+#define EMMC_PIN_D2  ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_D2_GPIO)
+#define EMMC_PIN_D3  ((gpio_num_t)CONFIG_EMMC_CTRL_EMMC_D3_GPIO)
+#define EMMC_MAX_FREQ_KHZ CONFIG_EMMC_CTRL_EMMC_MAX_FREQ_KHZ
+#define RAW_SD_METADATA_INTERVAL_BYTES (UINT64_C(64) * 1024U * 1024U)
 #define RAW_SD_RECORDER_SECTORS_PER_WRITE \
     (RAW_SD_RECORDER_WRITE_BUFFER_BYTES / RAW_SD_SECTOR_BYTES)
 
@@ -71,6 +73,30 @@ static esp_err_t write_data_block(raw_sd_recorder_t *recorder,
     recorder->next_write_lba += sectors;
     recorder->superblock.physical_bytes_written += bytes;
     recorder->active_segment.physical_bytes += bytes;
+    if (recorder->segment_open && recorder->next_metadata_bytes != 0U &&
+        recorder->superblock.physical_bytes_written >=
+            recorder->next_metadata_bytes) {
+        recorder->active_segment.valid_bytes =
+            recorder->active_pending_valid_bytes;
+        recorder->active_segment.frame_count =
+            recorder->active_segment.valid_bytes / RAW_SD_FRAME_BYTES;
+        recorder->active_segment.metadata_generation =
+            recorder->superblock.generation + 1U;
+        esp_err_t checkpoint_result = write_active_segment(recorder);
+        if (checkpoint_result == ESP_OK) {
+            checkpoint_result = write_superblocks(recorder);
+        }
+        if (checkpoint_result != ESP_OK) {
+            /* The data write already completed and next_write_lba advanced.
+             * Do not let close_segment write the same block a second time. */
+            recorder->write_buffer_used = 0U;
+            return checkpoint_result;
+        }
+        do {
+            recorder->next_metadata_bytes += RAW_SD_METADATA_INTERVAL_BYTES;
+        } while (recorder->next_metadata_bytes <=
+                 recorder->superblock.physical_bytes_written);
+    }
     return ESP_OK;
 }
 
@@ -176,7 +202,6 @@ esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder)
         return ESP_ERR_NO_MEM;
     }
     recorder->card_initialized = true;
-    sdmmc_card_print_info(stdout, &recorder->card);
     ESP_LOGI(TAG, "eMMC ready: 4-bit SDMMC, actual clock %.2f MHz",
              (double)recorder->card.real_freq_khz / 1000.0);
     return ESP_OK;
@@ -252,6 +277,9 @@ esp_err_t raw_sd_recorder_open_segment(raw_sd_recorder_t *recorder)
         return result;
     }
     recorder->segment_open = true;
+    recorder->next_metadata_bytes =
+        recorder->superblock.physical_bytes_written +
+        RAW_SD_METADATA_INTERVAL_BYTES;
     return ESP_OK;
 }
 
@@ -466,6 +494,7 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
      * uncommitted directory tail using the older superblock counters. */
     recorder->segment_open = false;
     recorder->active_pending_valid_bytes = 0U;
+    recorder->next_metadata_bytes = 0U;
     return content_result != ESP_OK ? content_result : superblock_result;
 }
 

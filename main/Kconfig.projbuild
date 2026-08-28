@@ -1,0 +1,66 @@
+menu "ADC eMMC controller configuration"
+
+config EMMC_CTRL_UART_PORT
+    int "Bridge UART port"
+    range 0 2
+    default 0
+
+config EMMC_CTRL_UART_TX_GPIO
+    int "Bridge UART TX GPIO"
+    range 0 48
+    default 43
+
+config EMMC_CTRL_UART_RX_GPIO
+    int "Bridge UART RX GPIO"
+    range 0 48
+    default 44
+
+config EMMC_CTRL_UART_BAUD_RATE
+    int "Bridge UART baud rate"
+    range 9600 5000000
+    default 921600
+
+config EMMC_CTRL_WRITE_SWITCH_GPIO
+    int "ADC recording switch GPIO"
+    range 0 48
+    default 7
+    help
+        A debounced low-to-high transition starts real ADC capture. A stable
+        low level stops capture, finalizes metadata, and permits UART reads.
+
+config EMMC_CTRL_EMMC_CLK_GPIO
+    int "eMMC CLK GPIO"
+    range 0 48
+    default 10
+
+config EMMC_CTRL_EMMC_CMD_GPIO
+    int "eMMC CMD GPIO"
+    range 0 48
+    default 9
+
+config EMMC_CTRL_EMMC_D0_GPIO
+    int "eMMC D0 GPIO"
+    range 0 48
+    default 13
+
+config EMMC_CTRL_EMMC_D1_GPIO
+    int "eMMC D1 GPIO"
+    range 0 48
+    default 14
+
+config EMMC_CTRL_EMMC_D2_GPIO
+    int "eMMC D2 GPIO"
+    range 0 48
+    default 12
+
+config EMMC_CTRL_EMMC_D3_GPIO
+    int "eMMC D3 GPIO"
+    range 0 48
+    default 11
+
+config EMMC_CTRL_EMMC_MAX_FREQ_KHZ
+    int "Maximum eMMC clock (kHz)"
+    range 400 40000
+    default 20000
+
+endmenu

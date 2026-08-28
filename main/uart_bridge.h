@@ -6,7 +6,8 @@
 extern "C" {
 #endif
 
-esp_err_t stim_controller_init(void);
+esp_err_t uart_bridge_init(void);
+void uart_bridge_run(void) __attribute__((noreturn));
 
 #ifdef __cplusplus
 }

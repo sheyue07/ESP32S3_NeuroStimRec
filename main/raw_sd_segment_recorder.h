@@ -35,6 +35,7 @@ typedef struct {
     uint8_t *write_buffer;
     size_t write_buffer_used;
     uint64_t active_pending_valid_bytes;
+    uint64_t next_metadata_bytes;
     uint32_t active_directory_lba;
     uint64_t next_write_lba;
     bool card_initialized;
