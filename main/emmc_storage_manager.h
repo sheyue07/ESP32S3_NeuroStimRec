@@ -14,6 +14,11 @@ extern "C" {
 #define EMMC_STORAGE_ERR_INTERLOCK ((esp_err_t)0x7101)
 #define EMMC_STORAGE_ERR_BUSY      ((esp_err_t)0x7102)
 #define EMMC_STORAGE_ERR_CARD      ((esp_err_t)0x7103)
+#define EMMC_STORAGE_ERR_RAW_OVERFLOW  ((esp_err_t)0x7110)
+#define EMMC_STORAGE_ERR_VALID_OVERFLOW ((esp_err_t)0x7111)
+#define EMMC_STORAGE_ERR_DMA_SEQUENCE  ((esp_err_t)0x7112)
+
+#define EMMC_CAPTURE_SOURCE_BLE   (1U << 1)
 
 typedef enum {
     EMMC_STATE_IDLE = 0,
@@ -26,9 +31,8 @@ typedef enum {
 typedef struct {
     emmc_state_t state;
     bool card_ready;
-    bool gpio7_high;
-    bool write_armed;
     bool result_available;
+    uint8_t capture_source_mask;
     uint64_t physical_bytes;
     uint64_t valid_bytes;
     uint64_t frame_count;
@@ -37,7 +41,9 @@ typedef struct {
     uint64_t raw_input_bytes;
     uint64_t dma_blocks;
     uint64_t dma_overruns;
-    uint64_t verified_samples;
+    uint64_t raw_overflow_bytes;
+    uint64_t valid_overflow_frames;
+    uint32_t dma_sequence_gaps;
     uint64_t write_elapsed_us;
     uint64_t wall_elapsed_us;
     uint32_t capture_outcome;
@@ -64,6 +70,7 @@ esp_err_t emmc_storage_execute_read(emmc_storage_read_operation_t operation,
 esp_err_t emmc_storage_request_write_start(void);
 esp_err_t emmc_storage_request_write_stop(void);
 esp_err_t emmc_storage_request_reinit(void);
+esp_err_t emmc_storage_set_capture_request(uint8_t source, bool active);
 const char *emmc_storage_state_name(emmc_state_t state);
 
 #ifdef __cplusplus

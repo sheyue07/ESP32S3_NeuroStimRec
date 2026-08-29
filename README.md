@@ -1,8 +1,8 @@
-# ESP32S3 ADC eMMC Controller
+# NeuroStimRec 神经信号采集刺激系统
 
-本工程用于在 ESP32-S3 上连续接收外部 30 MHz 串行 ADC 数据，完成帧同步后写入裸 eMMC，并通过 UART0 供上位机查询、扫描和导出。
+本工程用于在 ESP32-S3 上连续接收外部 30 MHz 串行 ADC 数据，完成帧同步后全量写入裸 eMMC，并通过 BLE 向 Android APP 发送最多 8 个所选通道的降采样实时预览。采集和刺激均由手机蓝牙控制；原 UART0 查询、扫描和导出功能继续保留。
 
-当前版本使用统一的 eMMC 管理任务串行执行所有存储操作。GPIO7 采集控制任务和 UART 上位机任务都不能直接访问 eMMC，从而避免采集、元数据收尾和数据导出互相冲突。
+当前版本使用统一的 eMMC 管理任务串行执行所有存储操作。蓝牙控制任务和 UART 上位机任务都不能直接访问 eMMC，从而避免采集、元数据收尾和数据导出互相冲突。
 
 ## 已验证状态
 
@@ -11,23 +11,26 @@
 - ADC 输入：30 MHz，MSB first，上升沿采样
 - eMMC：SDMMC 4-bit，配置上限 20 MHz
 - 控制串口：UART0，921600 baud，8N1
-- 实测连续有效写入：约 3.57 MiB/s
+- 蓝牙：NimBLE GATT，设备名 `NeuroStimRec`
+- 手机预览：最多 8 通道、1–200 Hz；预览拥塞只丢预览包，不阻塞 ADC/eMMC
+- ADC 满速输入约 3.58 MiB/s；当前将 eMMC 限制为 20 MHz，优先提高板级总线读写稳定性
 - 实测 UART 导出：约 89.6 KiB/s，接近 921600 baud 的 8N1 理论上限
 - 已验证 113.81 MiB 分段正常停止、导出并通过总 CRC32
-- 当前固件镜像约 320 KiB，1 MiB 应用分区剩余约 69%
+- 当前含 NimBLE 的固件镜像约 607 KiB，1 MiB 应用分区剩余约 41%
 
 > 注意：工程使用 eMMC 裸扇区，不使用 FAT 文件系统。开始一个新 run 会从固定数据区起点覆盖此前采集内容。
 
 ## 系统结构
 
 ```text
-GPIO7 写入开关 ──开始/停止请求──┐
+手机 BLE 控制 ─────采集请求──────┐
                                 │
 ADC CLK/DATA → SPI2/GDMA        ▼
               → 原始环形缓冲 → 帧同步 → 有效帧环形缓冲
-                                        │
-                                        ▼
-                                 eMMC 统一管理任务
+                                  │             │
+                                  │             └→ BLE 降采样预览
+                                  ▼
+                           eMMC 统一管理任务
                                  IDLE / WRITING
                                  FINALIZING / READING / ERROR
                                         ▲
@@ -52,7 +55,7 @@ ADC CLK/DATA → SPI2/GDMA        ▼
 |---|---:|---|---|
 | ADC CLK | 20 | 输入 | 30 MHz 外部时钟 |
 | ADC DATA | 16 | 输入 | 串行 ADC 数据，MSB first |
-| 采集开关 | 7 | 输入 | 高电平开始，低电平停止；内部下拉 |
+| 原采集开关 | 7 | 输入 | 仅保留电平观测，不再控制采集 |
 | UART0 TX | 43 | 输出 | TXD0，封装 37 脚 |
 | UART0 RX | 44 | 输入 | RXD0，封装 36 脚 |
 | eMMC CLK | 10 | 输出 | SDMMC clock |
@@ -61,13 +64,13 @@ ADC CLK/DATA → SPI2/GDMA        ▼
 | eMMC D1 | 14 | 双向 | 4-bit data |
 | eMMC D2 | 12 | 双向 | 4-bit data |
 | eMMC D3 | 11 | 双向 | 4-bit data |
-| 刺激使能 | 5 | 输入 | 独立于 GPIO7，100 us 消抖 |
+| 原刺激使能 | 5 | 输入 | 不再配置或读取，不控制刺激 |
 | 刺激 MCLK | 19 | 输出 | LCD_CAM/GDMA 生成 |
 | 刺激 SCLK | 8 | 输出 | 约 6.6 MHz |
 | 刺激 MOSI | 17 | 输出 | 串行命令数据 |
 | 刺激 CSb | 15 | 输出 | 低有效 |
 
-UART、eMMC 和 GPIO7 引脚可在 `idf.py menuconfig` 的 `ADC eMMC controller configuration` 中修改。ADC 和刺激接口引脚目前由头文件固定。
+UART 和 eMMC 引脚可在 `idf.py menuconfig` 的 `ADC eMMC controller configuration` 中修改。ADC 和刺激接口引脚目前由头文件固定。
 
 ## ADC 帧格式
 
@@ -79,6 +82,7 @@ UART、eMMC 和 GPIO7 引脚可在 `idf.py menuconfig` 的 `ADC eMMC controller 
 ```
 
 - 每个 ADC sample 按高字节在前接收。
+- ADC sample 是无符号 16 位数（`uint16_t`，范围 0..65535），不能按 `int16_t` 解释。
 - 帧内没有计数器。
 - 同步器会搜索全部 8 种位移和 2080 种帧相位。
 - 连续确认 8 个帧头后锁定。
@@ -86,14 +90,17 @@ UART、eMMC 和 GPIO7 引脚可在 `idf.py menuconfig` 的 `ADC eMMC controller 
 - 短暂错误进入 HOLDOVER；无法恢复时重新执行全局同步搜索。
 - 只有结构校验通过的完整帧会进入 eMMC 数据区。
 
-单个 run 的最大完整帧数为 4,129,776 帧，有效字节数为 1,073,741,760；补齐最后一个扇区后物理占用正好为 1 GiB。
+单个 run 不再使用固定 1 GiB 上限。启动时按 eMMC 实际扇区数动态计算数据区：
+`(物理扇区数 - 2048) × 512` 字节；每个分段末尾按 512 字节补齐，最后不足一帧
+的空间不会写入。当前已验证设备的物理容量为 7,820,083,200 字节，可用数据区
+为 7,819,034,624 字节。
 
-## GPIO7 与状态机
+## 手机蓝牙控制与状态机
 
-GPIO7 每 10 ms 采样一次，连续两次一致才确认变化。
+GPIO7 和 GPIO5 不再参与采集或刺激状态切换。手机通过 BLE 发送带 `request_id` 的开始/停止命令，ESP32 执行后返回确认；蓝牙断开时释放手机采集请求并请求刺激安全停止。
 
 ```text
-IDLE --GPIO7 高--> WRITING --GPIO7 低/写满/错误--> FINALIZING
+IDLE --BLE 开始--> WRITING --BLE 停止/写满/错误--> FINALIZING
   ^                                                        |
   |------------------- 成功收尾 ---------------------------|
 
@@ -105,13 +112,13 @@ IDLE --UART 读取--> READING --> IDLE
 
 | 状态 | 是否允许采集 | 是否允许 eMMC 读取 |
 |---|---|---|
-| IDLE | GPIO7 高可启动 | 仅 GPIO7 低时允许 |
+| IDLE | BLE 命令可启动 | 允许 |
 | WRITING | 正在采集 | 不允许 |
 | FINALIZING | 停止 DMA、排空缓冲、提交元数据 | 不允许 |
 | READING | 不允许启动采集 | 正在执行读取或导出 |
 | ERROR | 不允许 | 先执行 `REINIT` |
 
-操作时应让 GPIO7 保持低电平，直到状态从 `FINALIZING` 回到 `IDLE`，然后再进行下一次低到高触发。过快地低—高切换可能在收尾期间被拒绝，且不会自动重试。
+停止采集后应等待 APP 显示状态从 `FINALIZING` 回到 `IDLE` 再启动下一次采集；收尾期间的开始命令会被拒绝。
 
 ## eMMC 裸盘布局
 
@@ -123,7 +130,7 @@ IDLE --UART 读取--> READING --> IDLE
 | 1 | 超级块 B | 1 sector |
 | 2..255 | 分段目录 | 254 entries |
 | 256..2047 | 同步事件区 | 12,544 events |
-| 2048..2099199 | ADC 数据区 | 1 GiB |
+| 2048..eMMC 最后一个 LBA | ADC 数据区 | 剩余全部物理容量 |
 
 每个分段记录以下信息：
 
@@ -137,7 +144,7 @@ IDLE --UART 读取--> READING --> IDLE
 
 超级块保存两份，每写入约 64 MiB 数据更新一次运行元数据。断电后，上位机可以选择有效且 generation 更新的一份重新扫描。
 
-首次采集前仍可扫描和导出上次留在 eMMC 中的数据；本次启动后的第一次 GPIO7 采集会建立新 run，并从 LBA 2048 开始覆盖旧数据。`REINIT` 本身不擦除数据，但 `REINIT` 后的下一次采集同样会开始新 run。
+首次采集前仍可扫描和导出上次留在 eMMC 中的数据；本次启动后的第一次手机 BLE 采集会建立新 run，并从 LBA 2048 开始覆盖旧数据。`REINIT` 本身不擦除数据，但 `REINIT` 后的下一次采集同样会开始新 run。
 
 ## UART 协议
 
@@ -154,7 +161,7 @@ IDLE --UART 读取--> READING --> IDLE
 | `DATA <index> [offset] [length]` | 导出指定分段的有效数据 |
 | `READ <lba> <sector_count>` | 按 LBA 读取裸扇区 |
 | `EVENTS <index>` | 导出分段同步事件扇区 |
-| `REINIT` | 低电平且非忙状态下重新初始化 eMMC |
+| `REINIT` | 非忙状态下重新初始化 eMMC |
 | `HELP` | 查看命令帮助 |
 
 `DATA`、`READ` 和 `EVENTS` 使用 EMB1 二进制流：
@@ -170,14 +177,42 @@ N bytes   payload，最大 4096 字节
 
 每包携带 CRC32，流结束时再发送整个数据流的总 CRC32。这里的 CRC 用于检测 UART 传输错误，不参与 ADC 写入速度统计。写入期间不计算全量 eMMC 数据 CRC，因此目录中的 `data_crc` 当前为 0。
 
+固件对导出过程中的瞬时 eMMC CRC/超时错误最多原位重读 3 次。若重读仍失败，
+会在二进制流内返回明确的 `ERR READ` 并停止该次导出；上位机不会再把错误文本
+误判成 EMB1 数据包并发送无效重传确认。
+
 UART0 同时是默认日志控制台。协议初始化成功后，固件会关闭 ESP-IDF 日志输出，确保日志不会混入 `STATUS` 文本或 EMB1 二进制流。调试底层错误时应临时使用另一串口，或扩展现有协议返回诊断字段。
+
+## BLE 与 Android APP
+
+GATT 使用 NeuroStimRec 项目专属 UUID：
+
+| 用途 | UUID |
+|---|---|
+| Service | `11E28B44-7380-4DB2-9B18-AFE970475001` |
+| 手机写入 | `11E28B44-7380-4DB2-9B18-AFE970475002` |
+| ESP32 通知 | `11E28B44-7380-4DB2-9B18-AFE970475003` |
+
+主广播包包含专属 Service UUID，扫描响应包包含完整设备名
+`NeuroStimRec`，从而保持传统 BLE 广播的 31 字节限制并避免与通用
+Nordic UART Service 设备冲突。
+
+应用层采用版本化二进制协议，含消息序号、分片序号和 CRC-16/CCITT-FALSE。支持状态查询、预览通道配置、采集启停、刺激参数/控制命令以及实时预览数据。预览通道统一使用 `CH0–CH63`：`CHn` 从有效帧偏移 `4 + n × 4` 提取。Android 工程位于 `E:\graduation_project\NeuroStimRec_Android`。
+
+新版 `STATUS` 载荷为 56 字节，在原 40 字节状态末尾追加 `target_bytes`
+和 `capacity_bytes` 两个 64 位 little-endian 字段。前者是当前分段开始时的剩余
+可写容量，后者是 eMMC 物理容量；配套 APP 同时兼容旧版 40 字节状态。
+
+实时预览直接从 GPIO20/16 接收后的已验证 260 字节帧中提取，不读取 eMMC。预览队列满时仅增加预览丢弃计数；完整帧仍按原路径写入 eMMC。
+
+刺激配置采用 24 字节 BLE 载荷，字段名与 FPGA 保持一致：`Ch`、`ChipID`、`STclk_Sel`、`mode`、`Freq`、`PulseNum`、`PulseWA`、`PulseGap`、`PulseWC`、`PulseAMP`、`Stim`。ESP32 只在停止状态接受新配置，并使用双缓冲切换下一次启动序列；开始命令必须引用最近确认的配置版本。
 
 ## 编译与烧录
 
 请使用已经加载 ESP-IDF 6.0.2 环境的 PowerShell 或 ESP-IDF VS Code 扩展：
 
 ```powershell
-cd E:\ESP_IDF_File\ESP32S3_ADC_eMMC_Ctrl
+cd E:\ESP_IDF_File\ESP32S3_NeuroStimRec
 idf.py build
 idf.py -p COM4 flash
 ```
@@ -192,25 +227,24 @@ idf.py build
 主要产物：
 
 ```text
-build\ESP32S3_0202.bin
+build\NeuroStimRec.bin
 build\bootloader\bootloader.bin
 build\partition_table\partition-table.bin
 ```
 
-根 CMake 工程名仍为历史名称 `ESP32S3_0202`，所以固件文件使用该名称；这不影响运行。
+根 CMake 工程名为 `NeuroStimRec`，与 BLE 广播名和总项目名一致。
 
 ## 推荐操作流程
 
-1. 上电前保持 GPIO7 低电平。
-2. 启动上位机并连接 UART0，执行握手和 `STATUS`。
-3. 如需保留旧数据，先执行 `LIST` 和导出。
-4. GPIO7 拉高，开始正式 ADC 采集。
-5. 写入期间只轮询 `STATUS`，不要发起 eMMC 读取。
-6. GPIO7 拉低，并保持低电平等待 `FINALIZING` 完成。
-7. 状态回到 `IDLE` 后扫描分段并导出数据。
-8. 等待上位机报告总 CRC32 校验通过。
+1. 启动上位机并连接 UART0，执行握手和 `STATUS`。
+2. 如需保留旧数据，先执行 `LIST` 和导出。
+3. 在手机 APP 中连接 `NeuroStimRec`，选择预览通道并点击“开始采集”。
+4. 写入期间只轮询 `STATUS`，不要发起 eMMC 读取。
+5. 在手机 APP 中点击“停止采集”，等待 `FINALIZING` 完成。
+6. 状态回到 `IDLE` 后扫描分段并导出数据。
+7. 等待上位机报告总 CRC32 校验通过。
 
-上位机若仍显示“模拟数据写入测速”或“抽样校验 0 次”，这是沿用旧界面的文字。当前固件写入的是真实 ADC 帧，正式采集路径不执行模拟测速版本的抽样回读。
+手机预览默认约 50 点/秒，只用于低频趋势观察；超过 25 Hz 的输入会混叠，不能据此判断高频波形是否失真。完整 14.4 kframe/s 左右的有效帧仍写入 eMMC，应以导出的 BIN/MAT 数据验证 1 kHz 等高频信号。
 
 ## 分段结果码
 
@@ -230,24 +264,27 @@ build\partition_table\partition-table.bin
 | 文件 | 职责 |
 |---|---|
 | `main/main.c` | 初始化顺序和程序入口 |
-| `main/write_switch.c` | GPIO7 采集开关和消抖 |
 | `main/emmc_storage_manager.c` | ADC 管线、状态机、唯一 eMMC 所有者 |
 | `main/continuous_rx.c` | SPI2/GDMA 连续串行接收 |
 | `main/frame_sync.c` | 260 字节帧同步、校验和重同步 |
 | `main/raw_sd_segment_recorder.c` | 64 KiB 写缓存和裸盘分段记录 |
 | `main/raw_sd_segment_format.c` | 超级块、目录和事件扇区格式 |
-| `main/uart_bridge.c` | UART 文本命令、EMB1 导出和 CRC32 |
-| `main/stim_*.c` | GPIO5 控制的刺激命令波形 |
-| `main/Kconfig.projbuild` | UART、GPIO7 和 eMMC 可配置引脚 |
+| `main/uart_bridge.c` | UART 文本命令、2 KiB EMB1 分包、逐包 ACK/重传和 CRC32 |
+| `main/stim_*.c` | 手机 BLE 控制的动态刺激命令波形 |
+| `main/ble_protocol.c` | BLE 分片、CRC、命令解析和线格式 |
+| `main/ble_service.c` | NimBLE GATT、状态通知与控制任务 |
+| `main/adc_preview.c` | 从实时有效帧提取所选通道并限速预览 |
+| `main/Kconfig.projbuild` | UART 和 eMMC 可配置引脚 |
 
 ## 审查结论与已知边界
 
-2026-08-28 对当前代码执行了核心并发路径审查和 ESP-IDF 6.0.2 全量编译。未发现会阻断已验证“采集—GPIO 停止—扫描—CRC 导出”主流程的确定性 bug，全部工程源文件无编译警告。
+2026-08-29 对当前代码执行了核心并发路径审查和 ESP-IDF 6.0.2 全量编译。未发现会阻断已验证“手机开始采集—手机停止—扫描—CRC 导出”主流程的确定性 bug，全部工程源文件无编译警告。
 
 仍需注意以下边界：
 
-- 后续分段的 `STATUS target` 仍固定显示 1 GiB，而不是当前 run 的剩余容量；只影响进度显示，容量检查仍按物理剩余空间执行。
-- GPIO7 拉低时若同步器恰好处于 HOLDOVER 或全局搜索，当前收尾规则可能把分段记为 `FAILED_UNRESOLVED_SYNC`；已写入的有效帧仍保持完整。
+- `STATUS target` 是当前分段开始时的剩余可写容量；每关闭一个分段产生的扇区补齐会减少后续分段可用空间。
+- 如果开始采集后 IO20 没有外部时钟，SPI/GDMA 会等待数据，设备保持 `WRITING`、帧数和写入字节为 0，BLE/UART 仍可响应；当前没有无时钟自动超时。此时手机停止命令可以结束管线，但空分段会记为 `FAILED_UNRESOLVED_SYNC`，状态进入 `ERROR`，再次采集前需执行 `REINIT`。
+- 分段结果码 2 表示采集中确实发生过同步中断和恢复；应配合导出的 `EVENTS` 文件、FPGA 数据源和 IO16/IO20 逻辑分析结果定位，不能把它当作正常的干净采集。
 - 多种管线错误最终会合并为结果码 5，协议目前没有持久化具体失败阶段；应结合 `STATUS`、目录和事件数据定位。
 - 输入信号错误率过高会让同步器长期运行在较慢的全局搜索路径，2 MiB 原始环形缓冲可能溢出并触发结果码 5。
 - `continuous_rx.c` 和 `stim_waveform.c` 使用 ESP-IDF 私有 HAL/GDMA 接口，升级 ESP-IDF 后必须重新全量编译并做硬件回归测试。

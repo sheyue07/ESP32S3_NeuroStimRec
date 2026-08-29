@@ -5,6 +5,7 @@
 
 #include "driver/gpio.h"
 #include "esp_err.h"
+#include "stim_protocol.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,6 +40,8 @@ typedef struct {
 esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
                              void *user_data);
 esp_err_t stim_waveform_request_enabled(bool enabled);
+esp_err_t stim_waveform_configure(
+    const stim_protocol_parameters_t *parameters);
 void stim_waveform_enter_safe_state(void);
 void stim_waveform_deinit(void);
 void stim_waveform_get_status(stim_waveform_status_t *status);

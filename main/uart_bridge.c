@@ -12,12 +12,18 @@
 #include "driver/uart.h"
 #include "emmc_storage_manager.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
 #include "raw_sd_segment_format.h"
 #include "sdkconfig.h"
 
 #define COMMAND_BYTES 160U
-#define PACKET_PAYLOAD_BYTES 4096U
+#define PACKET_PAYLOAD_BYTES 2048U
 #define PACKET_MAGIC "EMB1"
+#define PACKET_ACK_MAGIC "EMA1"
+#define PACKET_ACK_TIMEOUT_MS 3000U
+#define PACKET_RETRY_LIMIT 5U
+#define PACKET_ACK_ACCEPT 0U
+#define EMMC_READ_ATTEMPT_LIMIT 3U
 
 typedef struct __attribute__((packed)) {
     uint8_t magic[4];
@@ -26,6 +32,12 @@ typedef struct __attribute__((packed)) {
     uint32_t payload_bytes;
     uint32_t payload_crc32;
 } packet_header_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t magic[4];
+    uint32_t sequence;
+    uint8_t status;
+} packet_ack_t;
 
 typedef enum {
     READ_LIST,
@@ -46,6 +58,8 @@ typedef struct {
 
 _Static_assert(sizeof(packet_header_t) == 24U,
                "EMB1 packet header must be 24 bytes");
+_Static_assert(sizeof(packet_ack_t) == 9U,
+               "EMA1 packet acknowledgement must be 9 bytes");
 
 static const uart_port_t bridge_uart =
     (uart_port_t)CONFIG_EMMC_CTRL_UART_PORT;
@@ -89,6 +103,17 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t bytes)
     return ~crc;
 }
 
+static bool receive_packet_ack(uint32_t sequence)
+{
+    packet_ack_t ack = {0};
+    const int received = uart_read_bytes(
+        bridge_uart, &ack, sizeof(ack),
+        pdMS_TO_TICKS(PACKET_ACK_TIMEOUT_MS));
+    return received == (int)sizeof(ack) &&
+           memcmp(ack.magic, PACKET_ACK_MAGIC, sizeof(ack.magic)) == 0 &&
+           ack.sequence == sequence && ack.status == PACKET_ACK_ACCEPT;
+}
+
 static bool parse_u64(const char *text, uint64_t *value)
 {
     if (text == NULL || value == NULL || *text == '\0' || *text == '-') {
@@ -111,13 +136,22 @@ static esp_err_t read_sectors(emmc_storage_access_t *access, uint64_t lba,
         lba >= capacity || count > capacity - lba || lba > SIZE_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
-    const esp_err_t result = sdmmc_read_sectors(
-        access->card, access->dma_buffer, (size_t)lba, count);
-    if (result == ESP_OK) {
-        *data = access->dma_buffer;
-    } else {
-        access->card_error = result;
+    esp_err_t result = ESP_FAIL;
+    for (uint32_t attempt = 0U; attempt < EMMC_READ_ATTEMPT_LIMIT; ++attempt) {
+        result = sdmmc_read_sectors(
+            access->card, access->dma_buffer, (size_t)lba, count);
+        if (result == ESP_OK) {
+            *data = access->dma_buffer;
+            return ESP_OK;
+        }
+        if (result != ESP_ERR_INVALID_CRC && result != ESP_ERR_TIMEOUT) {
+            break;
+        }
+        if (attempt + 1U < EMMC_READ_ATTEMPT_LIMIT) {
+            vTaskDelay(pdMS_TO_TICKS(2U));
+        }
     }
+    access->card_error = result;
     return result;
 }
 
@@ -205,8 +239,9 @@ static esp_err_t stream_bytes(emmc_storage_access_t *access,
                   byte_offset, total_bytes);
         return ESP_ERR_INVALID_SIZE;
     }
-    if (!uart_line("OK STREAM total=%" PRIu64 " packet_header=24",
-                   total_bytes)) {
+    if (!uart_line("OK STREAM total=%" PRIu64
+                   " packet_header=24 packet_payload=%u ack=1",
+                   total_bytes, PACKET_PAYLOAD_BYTES)) {
         return ESP_FAIL;
     }
 
@@ -240,9 +275,25 @@ static esp_err_t stream_bytes(emmc_storage_access_t *access,
             .payload_crc32 = crc32_update(0U, payload, payload_bytes),
         };
         memcpy(header.magic, PACKET_MAGIC, sizeof(header.magic));
-        if (!uart_write_all(&header, sizeof(header)) ||
-            !uart_write_all(payload, payload_bytes)) {
-            return ESP_FAIL;
+        bool acknowledged = false;
+        for (uint32_t attempt = 0U;
+             attempt < PACKET_RETRY_LIMIT && !acknowledged; ++attempt) {
+            if (!uart_write_all(&header, sizeof(header)) ||
+                !uart_write_all(payload, payload_bytes) ||
+                uart_wait_tx_done(
+                    bridge_uart,
+                    pdMS_TO_TICKS(PACKET_ACK_TIMEOUT_MS)) != ESP_OK) {
+                return ESP_FAIL;
+            }
+            acknowledged = receive_packet_ack(sequence);
+            if (!acknowledged) {
+                (void)uart_flush_input(bridge_uart);
+            }
+        }
+        if (!acknowledged) {
+            uart_line("ERR STREAM sequence=%" PRIu32 " retries=%u",
+                      sequence, PACKET_RETRY_LIMIT);
+            return ESP_ERR_TIMEOUT;
         }
         stream_crc = crc32_update(stream_crc, payload, payload_bytes);
         sent += payload_bytes;
@@ -261,9 +312,59 @@ static esp_err_t command_list(emmc_storage_access_t *access)
                   (unsigned int)result, esp_err_to_name(result));
         return ESP_OK;
     }
-    uint32_t count = superblock.segment_count;
-    if (count > RAW_SD_SEGMENT_DIRECTORY_CAPACITY) {
-        count = RAW_SD_SEGMENT_DIRECTORY_CAPACITY;
+    uint32_t committed_count = superblock.segment_count;
+    if (committed_count > RAW_SD_SEGMENT_DIRECTORY_CAPACITY) {
+        committed_count = RAW_SD_SEGMENT_DIRECTORY_CAPACITY;
+    }
+
+    /* The directory entries are the actual per-segment records.  Derive a
+     * second count from valid, physically contiguous entries instead of
+     * treating the redundant superblock counter as the only source of truth.
+     * This recovers captures whose slot was committed but whose counter stayed
+     * at zero, while LBA continuity prevents unrelated stale slots from being
+     * appended to the current run. */
+    uint32_t discovered_count = 0U;
+    uint64_t expected_lba = superblock.data_start_lba != 0U
+                                ? superblock.data_start_lba
+                                : RAW_SD_DATA_START_LBA;
+    uint32_t discovered_run_id = 0U;
+    for (uint32_t index = 0U;
+         index < RAW_SD_SEGMENT_DIRECTORY_CAPACITY; ++index) {
+        raw_sd_segment_t candidate;
+        if (load_segment(access, index, &candidate) != ESP_OK ||
+            candidate.segment_id != index + 1U ||
+            candidate.start_lba != expected_lba ||
+            (candidate.state != RAW_SD_SEGMENT_OPEN &&
+             candidate.state != RAW_SD_SEGMENT_CLOSED &&
+             candidate.state != RAW_SD_SEGMENT_FAILED) ||
+            (candidate.physical_bytes % RAW_SD_SECTOR_BYTES) != 0U) {
+            break;
+        }
+        if (index == 0U) {
+            discovered_run_id = candidate.run_id;
+        } else if (candidate.run_id != discovered_run_id) {
+            break;
+        }
+        ++discovered_count;
+        if (candidate.physical_bytes == 0U) {
+            break;
+        }
+        const uint64_t sectors = candidate.physical_bytes /
+                                 RAW_SD_SECTOR_BYTES;
+        const uint64_t capacity = (uint64_t)access->card->csd.capacity;
+        if (expected_lba >= capacity ||
+            sectors > capacity - expected_lba) {
+            break;
+        }
+        expected_lba += sectors;
+    }
+
+    uint32_t count = discovered_count != 0U
+                         ? discovered_count
+                         : committed_count;
+    if (count != committed_count) {
+        uart_line("WARN LIST committed=%" PRIu32 " discovered=%" PRIu32,
+                  committed_count, discovered_count);
     }
     uart_line("OK LIST count=%" PRIu32, count);
     for (uint32_t index = 0U; index < count; ++index) {
@@ -337,7 +438,7 @@ static void report_storage_error(esp_err_t result)
     emmc_status_t status;
     (void)emmc_storage_get_status(&status);
     if (result == EMMC_STORAGE_ERR_INTERLOCK) {
-        uart_line("ERR INTERLOCK gpio7=1 reason=WRITE_SWITCH_ACTIVE");
+        uart_line("ERR INTERLOCK reason=CAPTURE_ACTIVE");
     } else if (result == EMMC_STORAGE_ERR_BUSY) {
         uart_line("ERR BUSY mode=%s", emmc_storage_state_name(status.state));
     } else if (result == EMMC_STORAGE_ERR_CARD) {
@@ -366,24 +467,27 @@ static void command_status(void)
         ? ((double)status.physical_bytes * 1000000.0) /
           ((double)status.wall_elapsed_us * 1024.0 * 1024.0)
         : 0.0;
-    uart_line("OK STATUS state=%s gpio7=%s write_switch=%s write_armed=%u"
+    uart_line("OK STATUS state=%s control=BLE"
               " card=%s bytes=%" PRIu64 " target=%" PRIu64
               " failure=0x%x",
               emmc_storage_state_name(status.state),
-              status.gpio7_high ? "HIGH" : "LOW",
-              status.gpio7_high ? "ON" : "OFF",
-              status.write_armed ? 1U : 0U,
               status.card_ready ? "READY" : "ERROR",
               status.physical_bytes, status.target_bytes,
               (unsigned int)status.failure_code);
     uart_line("OK BENCH result_available=%u valid=%" PRIu64
-              " verified=%" PRIu64 " write_us=%" PRIu64
-              " wall_us=%" PRIu64 " raw_mib_s=%.2f"
-              " end_to_end_mib_s=%.2f",
+              " write_us=%" PRIu64 " wall_us=%" PRIu64
+              " raw_mib_s=%.2f"
+              " end_to_end_mib_s=%.2f raw_input=%" PRIu64
+              " dma_blocks=%" PRIu64 " dma_overruns=%" PRIu64
+              " raw_overflow=%" PRIu64 " valid_overflow=%" PRIu64
+              " dma_gaps=%" PRIu32,
               status.result_available ? 1U : 0U,
-              status.valid_bytes, status.verified_samples,
-              status.write_elapsed_us, status.wall_elapsed_us,
-              raw_rate, end_to_end_rate);
+              status.valid_bytes, status.write_elapsed_us,
+              status.wall_elapsed_us,
+              raw_rate, end_to_end_rate, status.raw_input_bytes,
+              status.dma_blocks, status.dma_overruns,
+              status.raw_overflow_bytes, status.valid_overflow_frames,
+              status.dma_sequence_gaps);
     uart_line("OK END");
 }
 
@@ -410,7 +514,7 @@ static void command_help(void)
     uart_line("DATA <segment_index> [byte_offset] [byte_length]");
     uart_line("READ <lba> <sector_count>");
     uart_line("EVENTS <segment_index>");
-    uart_line("GPIO7 high starts ADC capture; low stops and permits reads");
+    uart_line("Capture and stimulation start/stop are controlled by phone BLE");
     uart_line("OK END");
 }
 

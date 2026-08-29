@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "adc_preview.h"
 #include "continuous_rx.h"
 #include "emmc_storage_manager.h"
 #include "esp_err.h"
@@ -27,7 +28,6 @@
 #include "freertos/task.h"
 #include "raw_sd_segment_recorder.h"
 #include "stim_controller.h"
-#include "write_switch.h"
 
 static const char *TAG = "EMMC_MANAGER";
 
@@ -35,11 +35,11 @@ static const char *TAG = "EMMC_MANAGER";
 #define VALID_RING_BUFFER_SIZE      (12U * 1024U * 1024U)
 #define FRAME_BATCH_FRAMES          125U
 #define FRAME_BATCH_SIZE            (FRAME_BATCH_FRAMES * ADC_FRAME_SIZE_BYTES)
-#define MAX_RECORD_FRAMES           UINT64_C(4129776)
 #define RATE_LOG_INTERVAL_US        UINT64_C(1000000)
-#define CAPTURE_STOP_TIMEOUT_MS     5000
+#define CAPTURE_STOP_TIMEOUT_MS     15000
 #define STORAGE_QUEUE_LENGTH        16U
 #define STORAGE_READ_DMA_SECTORS    16U
+#define STORAGE_TASK_PRIORITY       8U
 #define SYNC_EVENT_CAPACITY \
     ((RAW_SD_EVENT_AREA_END_LBA - RAW_SD_EVENT_AREA_START_LBA) * \
      RAW_SD_EVENTS_PER_SECTOR)
@@ -63,6 +63,7 @@ typedef struct {
     bool enabled;
     bool failed;
     bool limit_reached;
+    esp_err_t failure_code;
     uint64_t accepted_frames;
     uint64_t raw_input_bytes;
     uint64_t last_dma_sequence;
@@ -112,6 +113,7 @@ static uint32_t sync_event_count;
 static uint32_t sync_event_overflow;
 static QueueHandle_t request_queue;
 static SemaphoreHandle_t status_mutex;
+static SemaphoreHandle_t capture_request_mutex;
 static emmc_status_t current_status;
 static uint8_t *read_dma_buffer;
 static recording_context_t manager_recording_context;
@@ -120,6 +122,7 @@ static bool stop_requested;
 static int64_t recording_start_us;
 static uint32_t last_capture_outcome;
 static uint32_t last_sync_state;
+static uint64_t capture_frame_limit;
 
 static void reset_capture_status(void)
 {
@@ -148,6 +151,7 @@ static void signal_capture_failure(const char *operation, esp_err_t error)
     xSemaphoreTake(recording_mutex, portMAX_DELAY);
     if (!capture_status.failed) {
         capture_status.failed = true;
+        capture_status.failure_code = error;
         snprintf(capture_status.failure_reason,
                  sizeof(capture_status.failure_reason),
                  "%s: 0x%x (%s)",
@@ -353,12 +357,14 @@ static bool validated_frame_callback(
         !flush_parser_batch(context)) {
         return false;
     }
-    if (context->total_frames >= MAX_RECORD_FRAMES) {
-        /* Reaching the complete-frame file limit is a normal stop condition. */
+    if (capture_frame_limit != 0U &&
+        context->total_frames >= capture_frame_limit) {
+        /* Reaching the usable eMMC data-area limit is a normal stop. */
         return true;
     }
 
     const bool announce_recording = context->total_frames == 0U;
+    adc_preview_ingest_frame(frame, context->total_frames + 1U);
     memcpy(context->batch + context->batch_pos,
            frame,
            ADC_FRAME_SIZE_BYTES);
@@ -377,7 +383,8 @@ static void publish_parser_progress(const parser_output_context_t *context)
 {
     xSemaphoreTake(recording_mutex, portMAX_DELAY);
     capture_status.accepted_frames = context->total_frames;
-    if (context->total_frames >= MAX_RECORD_FRAMES) {
+    if (capture_frame_limit != 0U &&
+        context->total_frames >= capture_frame_limit) {
         capture_status.limit_reached = true;
     }
     xSemaphoreGive(recording_mutex);
@@ -410,7 +417,7 @@ static void adc_dma_task(void *parameter)
                 if (!sequence_ok) {
                     (void)continuous_rx_release_block(block.index);
                     signal_capture_failure("DMA block sequence discontinuity",
-                                           ESP_ERR_INVALID_RESPONSE);
+                                           EMMC_STORAGE_ERR_DMA_SEQUENCE);
                     (void)continuous_rx_stop();
                     continue;
                 }
@@ -430,7 +437,7 @@ static void adc_dma_task(void *parameter)
                     capture_status.raw_overflow_bytes += block.length;
                     xSemaphoreGive(recording_mutex);
                     signal_capture_failure("raw PSRAM ring overflow",
-                                           ESP_ERR_NO_MEM);
+                                           EMMC_STORAGE_ERR_RAW_OVERFLOW);
                     (void)continuous_rx_stop();
                 }
 
@@ -519,16 +526,20 @@ static void frame_parser_task(void *parameter)
                     if (!parser_failed && !flush_parser_batch(&output)) {
                         parser_failed = true;
                         signal_capture_failure("valid frame ring overflow",
-                                               ESP_ERR_NO_MEM);
+                                               EMMC_STORAGE_ERR_VALID_OVERFLOW);
                         (void)continuous_rx_stop();
                     }
                 }
                 vRingbufferReturnItem(raw_ringbuf, item);
                 publish_parser_progress(&output);
                 ++processed_blocks;
-                /* One 1 ms idle window per 256 KiB avoids starving IDLE0
-                 * without imposing a delay on every 32 KiB DMA block. */
-                if ((processed_blocks & 7U) == 0U) {
+                /* Yield only when the parser is comfortably caught up.  The
+                 * old unconditional 1 ms delay every 256 KiB made a small
+                 * permanent throughput deficit accumulate until the 2 MiB
+                 * raw ring overflowed during longer BLE captures. */
+                if ((processed_blocks & 31U) == 0U &&
+                    xRingbufferGetCurFreeSize(raw_ringbuf) >
+                        (RAW_RING_BUFFER_SIZE * 3U) / 4U) {
                     vTaskDelay(1);
                 }
                 continue;
@@ -541,7 +552,7 @@ static void frame_parser_task(void *parameter)
 
         if (!parser_failed && !flush_parser_batch(&output)) {
             signal_capture_failure("valid frame ring final flush",
-                                   ESP_ERR_NO_MEM);
+                                   EMMC_STORAGE_ERR_VALID_OVERFLOW);
         }
         publish_parser_progress(&output);
         xSemaphoreGive(parser_stopped_sem);
@@ -616,8 +627,7 @@ static bool stop_pipeline_drain_and_finish(recording_context_t *context,
         wait_failed = true;
     }
 
-    (void)wait_failed;
-    return finish_recording(context, reason);
+    return finish_recording(context, reason) && !wait_failed;
 }
 
 static const char *capture_outcome_name(raw_sd_capture_outcome_t outcome)
@@ -714,6 +724,7 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     if (metadata_result != ESP_OK) {
         success = false;
         outcome = RAW_SD_CAPTURE_FAILED_PIPELINE;
+        context->io_failed = true;
         ESP_LOGE(TAG, "Raw eMMC segment metadata update failed: 0x%x (%s)",
                  (unsigned int)metadata_result,
                  esp_err_to_name(metadata_result));
@@ -861,6 +872,9 @@ static void update_status_progress(void)
     current_status.raw_input_bytes = capture.raw_input_bytes;
     current_status.dma_blocks = rx_stats.completed_blocks;
     current_status.dma_overruns = rx_stats.overruns;
+    current_status.raw_overflow_bytes = capture.raw_overflow_bytes;
+    current_status.valid_overflow_frames = capture.valid_overflow_frames;
+    current_status.dma_sequence_gaps = capture.dma_sequence_gaps;
     if (recording_start_us > 0) {
         current_status.wall_elapsed_us = now_us -
             (uint64_t)recording_start_us;
@@ -900,6 +914,8 @@ static void release_card(void)
     xSemaphoreTake(status_mutex, portMAX_DELAY);
     current_status.card_ready = false;
     current_status.capacity_sectors = 0U;
+    current_status.target_frames = 0U;
+    current_status.target_bytes = 0U;
     current_status.emmc_clock_khz = 0U;
     xSemaphoreGive(status_mutex);
 }
@@ -913,10 +929,59 @@ static esp_err_t prepare_card(void)
     xSemaphoreTake(status_mutex, portMAX_DELAY);
     current_status.capacity_sectors =
         (uint64_t)raw_recorder.card.csd.capacity;
+    current_status.target_bytes =
+        raw_sd_recorder_data_capacity_sectors(&raw_recorder) *
+        RAW_SD_SECTOR_BYTES;
+    current_status.target_frames =
+        current_status.target_bytes / ADC_FRAME_SIZE_BYTES;
     current_status.emmc_clock_khz =
         (uint32_t)raw_recorder.card.real_freq_khz;
     current_status.card_ready = true;
     xSemaphoreGive(status_mutex);
+    return ESP_OK;
+}
+
+static void reset_capture_pipeline_state(void)
+{
+    (void)discard_pipeline_buffers();
+    frame_sync_reset(&stream_sync);
+    reset_capture_status();
+    set_capture_enabled(false);
+    dma_session_done = true;
+    stop_requested = false;
+    recording_start_us = 0;
+    capture_frame_limit = 0U;
+    run_started = false;
+}
+
+static esp_err_t rebuild_card_and_receiver(void)
+{
+    /* sdmmc_card_init() needs a sizeable temporary internal-DMA allocation.
+     * Free the permanent ADC DMA ring and UART read buffer first; otherwise a
+     * reinitialization after BLE has been started predictably returns
+     * ESP_ERR_NO_MEM even though PSRAM is mostly empty. */
+    (void)continuous_rx_deinit();
+    heap_caps_free(read_dma_buffer);
+    read_dma_buffer = NULL;
+    release_card();
+
+    esp_err_t result = prepare_card();
+    if (result != ESP_OK) {
+        return result;
+    }
+    result = continuous_rx_init();
+    if (result != ESP_OK) {
+        release_card();
+        return result;
+    }
+    read_dma_buffer = heap_caps_malloc(
+        STORAGE_READ_DMA_SECTORS * RAW_SD_SECTOR_BYTES,
+        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (read_dma_buffer == NULL) {
+        (void)continuous_rx_deinit();
+        release_card();
+        return ESP_ERR_NO_MEM;
+    }
     return ESP_OK;
 }
 
@@ -933,6 +998,17 @@ static esp_err_t start_capture(void)
     if (raw_sd_recorder_run_is_full(&raw_recorder)) {
         return ESP_ERR_INVALID_SIZE;
     }
+
+    const uint64_t remaining_capacity =
+        raw_sd_recorder_remaining_capacity_bytes(&raw_recorder);
+    capture_frame_limit = remaining_capacity / ADC_FRAME_SIZE_BYTES;
+    if (capture_frame_limit == 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    xSemaphoreTake(status_mutex, portMAX_DELAY);
+    current_status.target_frames = capture_frame_limit;
+    current_status.target_bytes = remaining_capacity;
+    xSemaphoreGive(status_mutex);
 
     const uint64_t stale_bytes = discard_pipeline_buffers();
     if (stale_bytes > 0U) {
@@ -972,6 +1048,9 @@ static esp_err_t start_capture(void)
     current_status.raw_input_bytes = 0U;
     current_status.dma_blocks = 0U;
     current_status.dma_overruns = 0U;
+    current_status.raw_overflow_bytes = 0U;
+    current_status.valid_overflow_frames = 0U;
+    current_status.dma_sequence_gaps = 0U;
     current_status.write_elapsed_us = 0U;
     current_status.wall_elapsed_us = 0U;
     current_status.capture_outcome = 0U;
@@ -997,7 +1076,7 @@ static esp_err_t handle_request(const storage_request_t *request)
         if (snapshot.state != EMMC_STATE_IDLE) {
             return EMMC_STORAGE_ERR_BUSY;
         }
-        if (!write_switch_is_high()) {
+        if (snapshot.capture_source_mask == 0U) {
             return EMMC_STORAGE_ERR_INTERLOCK;
         }
         const esp_err_t result = start_capture();
@@ -1018,7 +1097,7 @@ static esp_err_t handle_request(const storage_request_t *request)
         if (snapshot.state != EMMC_STATE_IDLE) {
             return EMMC_STORAGE_ERR_BUSY;
         }
-        if (write_switch_is_high()) {
+        if (snapshot.capture_source_mask != 0U) {
             return EMMC_STORAGE_ERR_INTERLOCK;
         }
         set_state(EMMC_STATE_READING, ESP_OK);
@@ -1042,11 +1121,16 @@ static esp_err_t handle_request(const storage_request_t *request)
             snapshot.state == EMMC_STATE_READING) {
             return EMMC_STORAGE_ERR_BUSY;
         }
-        if (write_switch_is_high()) {
-            return EMMC_STORAGE_ERR_INTERLOCK;
-        }
-        release_card();
-        const esp_err_t result = prepare_card();
+        reset_capture_pipeline_state();
+        /* A parser/DMA overflow does not make the eMMC card unusable.  Reuse
+         * the already initialized card after the failed segment was closed;
+         * reserve the expensive host teardown for actual storage I/O errors. */
+        const bool can_reuse_card = raw_recorder.card_initialized &&
+                                    !raw_recorder.segment_open &&
+                                    !manager_recording_context.io_failed;
+        const esp_err_t result = can_reuse_card
+                                     ? ESP_OK
+                                     : rebuild_card_and_receiver();
         if (result == ESP_OK) {
             set_state(EMMC_STATE_IDLE, ESP_OK);
         } else {
@@ -1079,6 +1163,14 @@ static void storage_manager_task(void *parameter)
             get_capture_status(&capture);
             if (stop_requested || capture.failed || capture.limit_reached ||
                 raw_sd_recorder_run_is_full(&raw_recorder)) {
+                if (capture.failed) {
+                    /* A failed autonomous capture must release the BLE start
+                     * latch immediately.  This keeps Stop/recovery controls
+                     * usable while the pipeline is being drained. */
+                    xSemaphoreTake(status_mutex, portMAX_DELAY);
+                    current_status.capture_source_mask = 0U;
+                    xSemaphoreGive(status_mutex);
+                }
                 set_state(EMMC_STATE_FINALIZING,
                           capture.failed ? ESP_FAIL : ESP_OK);
                 continue;
@@ -1113,17 +1205,33 @@ static void storage_manager_task(void *parameter)
             get_capture_status(&capture);
             const char *reason = capture.failed
                 ? "capture failure"
-                : stop_requested ? "GPIO7 became low"
-                                 : "complete-frame 1 GiB limit reached";
+                : stop_requested ? "phone BLE stop requested"
+                                 : "usable eMMC data area reached";
             const bool success = stop_pipeline_drain_and_finish(
                 &manager_recording_context, reason);
             update_status_progress();
             xSemaphoreTake(status_mutex, portMAX_DELAY);
             current_status.result_available = true;
+            if (!success) {
+                /* An automatically failed capture is no longer an active BLE
+                 * request.  Leaving this bit set disabled recovery in both
+                 * the phone and PC tools and made them appear frozen. */
+                current_status.capture_source_mask = 0U;
+            }
             xSemaphoreGive(status_mutex);
             stop_requested = false;
+            capture_status_t final_capture;
+            get_capture_status(&final_capture);
+            esp_err_t final_error = final_capture.failure_code;
+            if (!success && final_error == ESP_OK) {
+                final_error = (esp_err_t)(uint32_t)
+                    raw_recorder.active_segment.failure_code;
+                if (final_error == ESP_OK) {
+                    final_error = ESP_FAIL;
+                }
+            }
             set_state(success ? EMMC_STATE_IDLE : EMMC_STATE_ERROR,
-                      success ? ESP_OK : ESP_FAIL);
+                      success ? ESP_OK : final_error);
             continue;
         }
 
@@ -1160,7 +1268,7 @@ esp_err_t emmc_storage_manager_init(void)
              "data area will be overwritten");
     ESP_LOGI(TAG,
              "Raw eMMC user-area layout: metadata LBA0..2047, data starts "
-             "LBA2048, capacity=1 GiB");
+             "LBA2048, capacity uses the rest of the physical eMMC");
 
     const esp_err_t stimulus_result = stim_controller_init();
     if (stimulus_result != ESP_OK) {
@@ -1172,12 +1280,14 @@ esp_err_t emmc_storage_manager_init(void)
     }
 
     status_mutex = xSemaphoreCreateMutex();
+    capture_request_mutex = xSemaphoreCreateMutex();
     request_queue = xQueueCreate(STORAGE_QUEUE_LENGTH,
                                  sizeof(storage_request_t));
     recording_mutex = xSemaphoreCreateMutex();
     dma_stopped_sem = xSemaphoreCreateBinary();
     parser_stopped_sem = xSemaphoreCreateBinary();
-    if (status_mutex == NULL || request_queue == NULL ||
+    if (status_mutex == NULL || capture_request_mutex == NULL ||
+        request_queue == NULL ||
         recording_mutex == NULL || dma_stopped_sem == NULL ||
         parser_stopped_sem == NULL) {
         ESP_LOGE(TAG, "Failed to create synchronization objects");
@@ -1185,9 +1295,8 @@ esp_err_t emmc_storage_manager_init(void)
     }
     memset(&current_status, 0, sizeof(current_status));
     current_status.state = EMMC_STATE_ERROR;
-    current_status.target_frames = MAX_RECORD_FRAMES;
-    current_status.target_bytes =
-        (uint64_t)RAW_SD_DATA_CAPACITY_SECTORS * RAW_SD_SECTOR_BYTES;
+    current_status.target_frames = 0U;
+    current_status.target_bytes = 0U;
 
     StaticRingbuffer_t *raw_ring_structure = heap_caps_calloc(
         1, sizeof(StaticRingbuffer_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -1242,10 +1351,28 @@ esp_err_t emmc_storage_manager_init(void)
     frame_sync_set_event_callback(
         &stream_sync, frame_sync_event_callback, NULL);
 
-    esp_err_t result = continuous_rx_init();
+    esp_err_t result = adc_preview_init();
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize BLE ADC preview queue: %s",
+                 esp_err_to_name(result));
+        return result;
+    }
+
+    /*
+     * sdmmc_card_init() needs temporary DMA-capable internal memory while it
+     * negotiates with the eMMC.  Initialize it before allocating the ADC DMA
+     * ring and task stacks; otherwise ESP_ERR_NO_MEM is returned even though
+     * ample PSRAM remains available.
+     */
+    const esp_err_t card_result = prepare_card();
+
+    result = continuous_rx_init();
     if (result != ESP_OK) {
         ESP_LOGE(TAG, "Continuous receiver initialization failed: 0x%x (%s)",
                  (unsigned int)result, esp_err_to_name(result));
+        if (card_result == ESP_OK) {
+            release_card();
+        }
         return result;
     }
     ESP_LOGI(TAG, "Continuous GDMA ring ready: %u x %u bytes",
@@ -1255,11 +1382,14 @@ esp_err_t emmc_storage_manager_init(void)
              "parser(CPU0/P10) -> valid 12 MiB -> eMMC(CPU1/P6)");
 
     parser_batch_storage = heap_caps_malloc(
-        FRAME_BATCH_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        FRAME_BATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (parser_batch_storage == NULL) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte parser batch",
                  (unsigned int)FRAME_BATCH_SIZE);
         continuous_rx_deinit();
+        if (card_result == ESP_OK) {
+            release_card();
+        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -1269,6 +1399,9 @@ esp_err_t emmc_storage_manager_init(void)
     if (read_dma_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate UART read DMA buffer");
         continuous_rx_deinit();
+        if (card_result == ESP_OK) {
+            release_card();
+        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -1282,6 +1415,9 @@ esp_err_t emmc_storage_manager_init(void)
             0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create ADC DMA task");
         continuous_rx_deinit();
+        if (card_result == ESP_OK) {
+            release_card();
+        }
         return ESP_ERR_NO_MEM;
     }
 
@@ -1297,10 +1433,12 @@ esp_err_t emmc_storage_manager_init(void)
         vTaskDelete(dma_task_handle);
         dma_task_handle = NULL;
         continuous_rx_deinit();
+        if (card_result == ESP_OK) {
+            release_card();
+        }
         return ESP_ERR_NO_MEM;
     }
 
-    const esp_err_t card_result = prepare_card();
     if (card_result == ESP_OK) {
         set_state(EMMC_STATE_IDLE, ESP_OK);
     } else {
@@ -1314,7 +1452,7 @@ esp_err_t emmc_storage_manager_init(void)
             "EMMC_STORAGE",
             8192,
             NULL,
-            6,
+            STORAGE_TASK_PRIORITY,
             NULL,
             1) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create eMMC storage manager task");
@@ -1339,8 +1477,6 @@ esp_err_t emmc_storage_get_status(emmc_status_t *status)
     xSemaphoreTake(status_mutex, portMAX_DELAY);
     *status = current_status;
     xSemaphoreGive(status_mutex);
-    status->gpio7_high = write_switch_is_high();
-    status->write_armed = write_switch_is_armed();
     return ESP_OK;
 }
 
@@ -1358,7 +1494,7 @@ esp_err_t emmc_storage_execute_read(emmc_storage_read_operation_t operation,
     if (status.state != EMMC_STATE_IDLE) {
         return EMMC_STORAGE_ERR_BUSY;
     }
-    if (write_switch_is_high()) {
+    if (status.capture_source_mask != 0U) {
         return EMMC_STORAGE_ERR_INTERLOCK;
     }
     storage_request_t request = {
@@ -1379,7 +1515,7 @@ esp_err_t emmc_storage_request_write_start(void)
     if (status.state != EMMC_STATE_IDLE) {
         return EMMC_STORAGE_ERR_BUSY;
     }
-    if (!write_switch_is_high()) {
+    if (status.capture_source_mask == 0U) {
         return EMMC_STORAGE_ERR_INTERLOCK;
     }
     storage_request_t request = {.type = STORAGE_REQUEST_START_WRITE};
@@ -1406,11 +1542,41 @@ esp_err_t emmc_storage_request_reinit(void)
         status.state == EMMC_STATE_READING) {
         return EMMC_STORAGE_ERR_BUSY;
     }
-    if (write_switch_is_high()) {
+    if (status.capture_source_mask != 0U) {
         return EMMC_STORAGE_ERR_INTERLOCK;
     }
     storage_request_t request = {.type = STORAGE_REQUEST_REINIT};
     return submit_request(&request);
+}
+
+esp_err_t emmc_storage_set_capture_request(uint8_t source, bool active)
+{
+    if (capture_request_mutex == NULL || status_mutex == NULL ||
+        source != EMMC_CAPTURE_SOURCE_BLE) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    xSemaphoreTake(capture_request_mutex, portMAX_DELAY);
+    xSemaphoreTake(status_mutex, portMAX_DELAY);
+    const uint8_t previous = current_status.capture_source_mask;
+    const uint8_t next = active ? (uint8_t)(previous | source)
+                                : (uint8_t)(previous & (uint8_t)~source);
+    current_status.capture_source_mask = next;
+    xSemaphoreGive(status_mutex);
+
+    esp_err_t result = ESP_OK;
+    if (previous == 0U && next != 0U) {
+        result = emmc_storage_request_write_start();
+        if (result != ESP_OK) {
+            xSemaphoreTake(status_mutex, portMAX_DELAY);
+            current_status.capture_source_mask = previous;
+            xSemaphoreGive(status_mutex);
+        }
+    } else if (previous != 0U && next == 0U) {
+        result = emmc_storage_request_write_stop();
+    }
+    xSemaphoreGive(capture_request_mutex);
+    return result;
 }
 
 const char *emmc_storage_state_name(emmc_state_t state)

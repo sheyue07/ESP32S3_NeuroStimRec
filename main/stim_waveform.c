@@ -54,11 +54,12 @@ typedef struct {
     intr_handle_t lcd_interrupt;
     stim_waveform_event_callback_t event_callback;
     void *event_user_data;
+    uint8_t active_sequence_bank;
     portMUX_TYPE lock;
 } stim_waveform_context_t;
 
-DMA_ATTR static uint8_t s_stop_loop[STIM_SLOT_SAMPLES];
-DMA_ATTR static uint8_t s_start_sequence[STIM_START_SEQUENCE_SAMPLES];
+DMA_ATTR static uint8_t s_stop_loops[2][STIM_SLOT_SAMPLES];
+DMA_ATTR static uint8_t s_start_sequences[2][STIM_START_SEQUENCE_SAMPLES];
 DMA_ATTR static uint8_t s_enabled_idle[STIM_SLOT_SAMPLES];
 
 DMA_ATTR static dma_descriptor_align4_t s_stop_descriptor;
@@ -98,16 +99,23 @@ static void stim_waveform_restore_start_chain(void)
 static void stim_waveform_configure_descriptors(void)
 {
     stim_waveform_init_descriptor(
-        &s_stop_descriptor, s_stop_loop, false, &s_stop_descriptor);
+        &s_stop_descriptor,
+        s_stop_loops[s_waveform.active_sequence_bank],
+        false,
+        &s_stop_descriptor);
     stim_waveform_init_descriptor(
-        &s_stop_entry_descriptor, s_stop_loop, true, &s_stop_descriptor);
+        &s_stop_entry_descriptor,
+        s_stop_loops[s_waveform.active_sequence_bank],
+        true,
+        &s_stop_descriptor);
     stim_waveform_init_descriptor(
         &s_enabled_descriptor, s_enabled_idle, false, &s_enabled_descriptor);
 
     for (size_t index = 0U; index < STIM_START_DESCRIPTOR_COUNT; ++index) {
         stim_waveform_init_descriptor(
             &s_start_descriptors[index],
-            s_start_sequence + index * STIM_SLOT_SAMPLES,
+            s_start_sequences[s_waveform.active_sequence_bank] +
+                index * STIM_SLOT_SAMPLES,
             true,
             index + 1U < STIM_START_DESCRIPTOR_COUNT
                 ? &s_start_descriptors[index + 1U]
@@ -449,13 +457,20 @@ esp_err_t stim_waveform_init(stim_waveform_event_callback_t event_callback,
     }
 
     stim_waveform_build_buffers(
-        start_frames, s_stop_loop, s_start_sequence, s_enabled_idle);
+        start_frames, s_stop_loops[0], s_start_sequences[0], s_enabled_idle);
     if (!stim_waveform_validate_buffers(start_frames,
-                                        s_stop_loop,
-                                        s_start_sequence,
+                                        s_stop_loops[0],
+                                        s_start_sequences[0],
                                         s_enabled_idle)) {
         return ESP_ERR_INVALID_RESPONSE;
     }
+    memcpy(s_stop_loops[1],
+           s_stop_loops[0],
+           sizeof(s_stop_loops[0]));
+    memcpy(s_start_sequences[1],
+           s_start_sequences[0],
+           sizeof(s_start_sequences[0]));
+    s_waveform.active_sequence_bank = 0U;
     stim_waveform_configure_descriptors();
     s_waveform.event_callback = event_callback;
     s_waveform.event_user_data = user_data;
@@ -549,6 +564,61 @@ esp_err_t stim_waveform_request_enabled(bool enabled)
             s_start_descriptors[index].next = &s_stop_entry_descriptor;
         }
     }
+    portEXIT_CRITICAL(&s_waveform.lock);
+    return ESP_OK;
+}
+
+esp_err_t stim_waveform_configure(
+    const stim_protocol_parameters_t *parameters)
+{
+    if (parameters == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_waveform.initialized || s_waveform.fatal) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t active_bank;
+    portENTER_CRITICAL(&s_waveform.lock);
+    if (s_waveform.requested_enabled ||
+        s_waveform.state != STIM_WAVEFORM_STOP_LOOP) {
+        portEXIT_CRITICAL(&s_waveform.lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    active_bank = s_waveform.active_sequence_bank;
+    portEXIT_CRITICAL(&s_waveform.lock);
+
+    uint8_t frames
+        [STIM_PROTOCOL_START_FRAME_COUNT][STIM_PROTOCOL_FRAME_BYTES];
+    if (!stim_protocol_build_parameter_frames(parameters, frames)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const uint8_t next_bank = active_bank == 0U ? 1U : 0U;
+    stim_waveform_build_slot(frames[0], s_stop_loops[next_bank]);
+    for (size_t index = 0U;
+         index < STIM_PROTOCOL_START_FRAME_COUNT;
+         ++index) {
+        stim_waveform_build_slot(
+            frames[index],
+            s_start_sequences[next_bank] + index * STIM_SLOT_SAMPLES);
+    }
+
+    portENTER_CRITICAL(&s_waveform.lock);
+    if (s_waveform.requested_enabled ||
+        s_waveform.state != STIM_WAVEFORM_STOP_LOOP ||
+        s_waveform.active_sequence_bank != active_bank) {
+        portEXIT_CRITICAL(&s_waveform.lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_stop_descriptor.buffer = s_stop_loops[next_bank];
+    s_stop_entry_descriptor.buffer = s_stop_loops[next_bank];
+    for (size_t index = 0U;
+         index < STIM_START_DESCRIPTOR_COUNT;
+         ++index) {
+        s_start_descriptors[index].buffer =
+            s_start_sequences[next_bank] + index * STIM_SLOT_SAMPLES;
+    }
+    s_waveform.active_sequence_bank = next_bank;
     portEXIT_CRITICAL(&s_waveform.lock);
     return ESP_OK;
 }

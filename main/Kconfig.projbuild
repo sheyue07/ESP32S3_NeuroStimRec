@@ -20,14 +20,6 @@ config EMMC_CTRL_UART_BAUD_RATE
     range 9600 5000000
     default 921600
 
-config EMMC_CTRL_WRITE_SWITCH_GPIO
-    int "ADC recording switch GPIO"
-    range 0 48
-    default 7
-    help
-        A debounced low-to-high transition starts real ADC capture. A stable
-        low level stops capture, finalizes metadata, and permits UART reads.
-
 config EMMC_CTRL_EMMC_CLK_GPIO
     int "eMMC CLK GPIO"
     range 0 48

@@ -2,20 +2,18 @@
 
 #include <string.h>
 
-#define STIM_PROTOCOL_DEFAULT_CHANNEL 0x23U
-
-static const stim_protocol_command_t
-    s_start_commands[STIM_PROTOCOL_START_FRAME_COUNT] = {
-        {.global = true, .data = 0x2A0D},
-        {.read = true, .data = 0x2A0D},
-        {.register_address = 1U, .data = 0x0006},
-        {.register_address = 2U, .data = 0xC323},
-        {.register_address = 3U, .data = 0x0064},
-        {.register_address = 4U, .data = 0x0014},
-        {.register_address = 5U, .data = 0x0005},
-        {.register_address = 6U, .data = 0x0014},
-        {.register_address = 7U, .data = 0xFFFF},
-        {.enable = true, .register_address = 0U, .data = 0xFFFF},
+const stim_protocol_parameters_t stim_protocol_default_parameters = {
+    .Ch = 0x23U,
+    .ChipID = 0x2A0DU,
+    .STclk_Sel = 0U,
+    .mode = 0x0006U,
+    .Freq = 0xC323U,
+    .PulseNum = 0x0064U,
+    .PulseWA = 0x0014U,
+    .PulseGap = 0x0005U,
+    .PulseWC = 0x0014U,
+    .PulseAMP = 0xFFFFU,
+    .Stim = 0xFFFFU,
 };
 
 const uint8_t stim_start_golden_frames
@@ -68,14 +66,37 @@ bool stim_protocol_build_frame(
 bool stim_protocol_build_start_frames(
     uint8_t output[STIM_PROTOCOL_START_FRAME_COUNT][STIM_PROTOCOL_FRAME_BYTES])
 {
-    if (output == NULL) {
+    return stim_protocol_build_parameter_frames(
+        &stim_protocol_default_parameters, output);
+}
+
+bool stim_protocol_build_parameter_frames(
+    const stim_protocol_parameters_t *parameters,
+    uint8_t output[STIM_PROTOCOL_START_FRAME_COUNT][STIM_PROTOCOL_FRAME_BYTES])
+{
+    if (parameters == NULL || output == NULL || parameters->Ch > 0x3FU ||
+        parameters->STclk_Sel > 3U) {
         return false;
     }
+
+    const stim_protocol_command_t commands[STIM_PROTOCOL_START_FRAME_COUNT] = {
+        {.global = true, .data = parameters->ChipID},
+        {.read = true, .data = parameters->ChipID},
+        {.register_address = 1U, .data = parameters->mode},
+        {.register_address = 2U, .data = parameters->Freq},
+        {.register_address = 3U, .data = parameters->PulseNum},
+        {.register_address = 4U, .data = parameters->PulseWA},
+        {.register_address = 5U, .data = parameters->PulseGap},
+        {.register_address = 6U, .data = parameters->PulseWC},
+        {.register_address = 7U, .data = parameters->PulseAMP},
+        {.enable = true, .register_address = 0U, .data = parameters->Stim},
+    };
     for (size_t index = 0U;
          index < STIM_PROTOCOL_START_FRAME_COUNT;
          ++index) {
-        stim_protocol_command_t command = s_start_commands[index];
-        command.channel_address = STIM_PROTOCOL_DEFAULT_CHANNEL;
+        stim_protocol_command_t command = commands[index];
+        command.channel_address = parameters->Ch;
+        command.stclk_select = parameters->STclk_Sel;
         if (!stim_protocol_build_frame(&command, output[index])) {
             return false;
         }

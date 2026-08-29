@@ -36,6 +36,8 @@ typedef struct {
     size_t write_buffer_used;
     uint64_t active_pending_valid_bytes;
     uint64_t next_metadata_bytes;
+    uint64_t data_capacity_sectors;
+    uint64_t data_end_lba;
     uint32_t active_directory_lba;
     uint64_t next_write_lba;
     bool card_initialized;
@@ -56,6 +58,10 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
                                         esp_err_t failure_code,
                                         const raw_sd_segment_diagnostics_t *diagnostics);
 bool raw_sd_recorder_run_is_full(const raw_sd_recorder_t *recorder);
+uint64_t raw_sd_recorder_data_capacity_sectors(
+    const raw_sd_recorder_t *recorder);
+uint64_t raw_sd_recorder_remaining_capacity_bytes(
+    const raw_sd_recorder_t *recorder);
 
 #ifdef __cplusplus
 }
