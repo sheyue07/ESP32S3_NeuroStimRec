@@ -38,7 +38,7 @@ static const char *TAG = "EMMC_MANAGER";
 #define RATE_LOG_INTERVAL_US        UINT64_C(1000000)
 #define CAPTURE_STOP_TIMEOUT_MS     15000
 #define STORAGE_QUEUE_LENGTH        16U
-#define STORAGE_READ_DMA_SECTORS    16U
+#define STORAGE_READ_DMA_SECTORS    4U
 #define STORAGE_TASK_PRIORITY       8U
 #define SYNC_EVENT_CAPACITY \
     ((RAW_SD_EVENT_AREA_END_LBA - RAW_SD_EVENT_AREA_START_LBA) * \
@@ -1381,8 +1381,15 @@ esp_err_t emmc_storage_manager_init(void)
              "FreeRTOS pipeline: DMA(CPU0/P20) -> raw 2 MiB -> "
              "parser(CPU0/P10) -> valid 12 MiB -> eMMC(CPU1/P6)");
 
+    /*
+     * This buffer is on the ADC -> parser -> eMMC hot path. Keeping it in
+     * PSRAM made every frame batch compete for the external-memory bus and
+     * caused the parser to fall behind even when BLE was disabled. The
+     * stripped-down BLE configuration leaves enough internal SRAM for the
+     * original, proven allocation strategy.
+     */
     parser_batch_storage = heap_caps_malloc(
-        FRAME_BATCH_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        FRAME_BATCH_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (parser_batch_storage == NULL) {
         ESP_LOGE(TAG, "Failed to allocate %u-byte parser batch",
                  (unsigned int)FRAME_BATCH_SIZE);

@@ -43,11 +43,11 @@ ADC CLK/DATA → SPI2/GDMA        ▼
 | 环节 | CPU / 优先级 | 缓冲 |
 |---|---:|---:|
 | SPI2/GDMA 搬运 | CPU0 / 20 | 4 × 32 KiB 内部 DMA 块 |
-| 原始流解析 | CPU0 / 10 | 2 MiB PSRAM byte ring |
-| 有效帧写盘 | CPU1 / 6 | 12 MiB PSRAM no-split ring |
-| eMMC 写缓存 | CPU1 / 6 | 64 KiB 内部 DMA 缓冲 |
+| 原始流解析 | CPU0 / 10 | 2 MiB PSRAM byte ring + 32.5 KiB 内部 RAM 批缓冲 |
+| 有效帧写盘 | CPU1 / 8 | 12 MiB PSRAM no-split ring |
+| eMMC 写缓存 | CPU1 / 8 | 64 KiB 内部 DMA 缓冲 |
 
-工程至少需要能够容纳约 14 MiB 环形缓冲及其他工作区的 PSRAM；当前配置使用 80 MHz Octal PSRAM。
+工程至少需要能够容纳约 14 MiB 环形缓冲及其他工作区的 PSRAM；当前配置使用 80 MHz Octal PSRAM。高频访问的帧解析批缓冲保留在内部 RAM，避免采集解析与 PSRAM 环形缓冲争用外部存储总线。BLE 仅启用外设广播和 GATT Server 所需功能，未使用的 Central、Observer、安全配对和标准服务均关闭。
 
 ## 引脚定义
 
@@ -224,6 +224,9 @@ idf.py fullclean
 idf.py build
 ```
 
+`sdkconfig.defaults` 保存了精简后的 BLE 和内部 RAM 配置。即使删除
+`sdkconfig` 与 `build` 后重新配置，也会恢复本工程验证过的关键选项。
+
 主要产物：
 
 ```text
@@ -278,7 +281,7 @@ build\partition_table\partition-table.bin
 
 ## 审查结论与已知边界
 
-2026-08-29 对当前代码执行了核心并发路径审查和 ESP-IDF 6.0.2 全量编译。未发现会阻断已验证“手机开始采集—手机停止—扫描—CRC 导出”主流程的确定性 bug，全部工程源文件无编译警告。
+2026-08-30 对采集热路径与 BLE 内存配置完成调整并通过 ESP-IDF 6.0.2 全量编译：静态 DIRAM 使用 96,595 字节，固件镜像约 613 KiB。该构建仍需在真实硬件上完成“BLE 扫描连接—30 秒采集—停止—扫描分段—导出”的回归验证。
 
 仍需注意以下边界：
 
