@@ -53,6 +53,7 @@ typedef struct {
     volatile uint64_t completed_blocks;
     volatile uint64_t descriptor_errors;
     volatile uint64_t overruns;
+    volatile uint64_t spi_fifo_overruns;
     volatile uint64_t queue_full_errors;
     volatile uint64_t unexpected_eof_errors;
     portMUX_TYPE lock;
@@ -120,6 +121,18 @@ static bool IRAM_ATTR continuous_rx_on_descriptor_done(
     (void)dma_channel;
     (void)event_data;
     (void)user_data;
+
+    /* SPI2 has its own RX FIFO overflow flag.  A FIFO overflow loses input
+     * data before GDMA writes the next descriptor, so descriptor sequence
+     * counters remain continuous and cannot reveal it.  The flag is sticky;
+     * sample and clear it at every descriptor completion. */
+    if (s_rx.spi_hal.hw->dma_int_raw.infifo_full_err != 0U) {
+        s_rx.spi_hal.hw->dma_int_clr.val = 1U;
+        ++s_rx.spi_fifo_overruns;
+        ++s_rx.overruns;
+        continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_SPI_FIFO_OVERRUN);
+        return false;
+    }
 
     BaseType_t task_woken = pdFALSE;
     const uint32_t descriptor_position = s_rx.descriptor_position + 1U;
@@ -201,6 +214,7 @@ static void continuous_rx_reset_runtime_state(void)
     s_rx.completed_blocks = 0;
     s_rx.descriptor_errors = 0;
     s_rx.overruns = 0;
+    s_rx.spi_fifo_overruns = 0;
     s_rx.queue_full_errors = 0;
     s_rx.unexpected_eof_errors = 0;
     s_rx.first_error = CONTINUOUS_RX_ERROR_NONE;
@@ -283,10 +297,18 @@ esp_err_t continuous_rx_init(void)
     result = gdma_apply_strategy(s_rx.dma_channel, &strategy);
     if (result == ESP_OK) {
         const gdma_transfer_config_t transfer = {
-            .max_data_burst_size = 32,
+            /* Drain the SPI RX FIFO with the largest burst supported by the
+             * ESP32-S3 AHB GDMA.  This reduces FIFO pressure while BLE and
+             * other peripherals contend for the internal bus. */
+            .max_data_burst_size = 64,
             .access_ext_mem = false,
         };
         result = gdma_config_transfer(s_rx.dma_channel, &transfer);
+    }
+    if (result == ESP_OK) {
+        /* ADC input is lossless and cannot apply back-pressure to the FPGA.
+         * Give its GDMA channel precedence over best-effort peripherals. */
+        result = gdma_set_priority(s_rx.dma_channel, 5U);
     }
     if (result != ESP_OK) {
         gdma_disconnect(s_rx.dma_channel);
@@ -354,6 +376,7 @@ esp_err_t continuous_rx_start(void)
     spi_slave_hal_hw_reset(&s_rx.spi_hal);
     spi_slave_hal_setup_device(&s_rx.spi_hal);
     spi_ll_disable_int(s_rx.spi_hal.hw);
+    s_rx.spi_hal.hw->dma_int_clr.val = 1U;
     spi_ll_enable_mosi(s_rx.spi_hal.hw, true);
     spi_ll_enable_miso(s_rx.spi_hal.hw, false);
     spi_slave_hal_hw_prepare_rx(s_rx.spi_hal.hw);
@@ -438,6 +461,7 @@ void continuous_rx_get_stats(continuous_rx_stats_t *stats)
         .completed_blocks = s_rx.completed_blocks,
         .descriptor_errors = s_rx.descriptor_errors,
         .overruns = s_rx.overruns,
+        .spi_fifo_overruns = s_rx.spi_fifo_overruns,
         .queue_full_errors = s_rx.queue_full_errors,
         .unexpected_eof_errors = s_rx.unexpected_eof_errors,
         .first_error = s_rx.first_error,

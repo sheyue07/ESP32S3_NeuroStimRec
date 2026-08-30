@@ -8,6 +8,7 @@
 #include "freertos/task.h"
 
 #define ADC_PREVIEW_INPUT_FRAME_HZ 14423U
+#define ADC_PREVIEW_FRAME_BYTES 260U
 
 typedef struct {
     portMUX_TYPE lock;
@@ -21,9 +22,8 @@ typedef struct {
     uint16_t actual_hz;
     uint32_t decimation;
     uint32_t generation;
-    /* The fields below are used only by the frame-parser task.  Keeping a
-     * local snapshot avoids taking a cross-core critical section for every
-     * 14.4 kHz ADC frame merely to produce a 50 Hz phone preview. */
+    /* The fields below are used only by the storage task. Keeping a local
+     * snapshot avoids a cross-core critical section for every frame. */
     uint32_t ingest_generation;
     uint32_t ingest_phase;
     uint32_t ingest_decimation;
@@ -107,9 +107,11 @@ void adc_preview_disable(void)
     }
 }
 
-void adc_preview_ingest_frame(const uint8_t frame[260], uint64_t frame_index)
+void adc_preview_ingest_batch(const uint8_t *frames,
+                              size_t frame_count,
+                              uint64_t first_frame_index)
 {
-    if (frame == NULL || s_preview.queue == NULL) {
+    if (frames == NULL || frame_count == 0U || s_preview.queue == NULL) {
         return;
     }
     const uint32_t generation = __atomic_load_n(
@@ -125,32 +127,42 @@ void adc_preview_ingest_frame(const uint8_t frame[260], uint64_t frame_index)
         s_preview.ingest_phase = 0U;
         portEXIT_CRITICAL(&s_preview.lock);
     }
-    if (!s_preview.ingest_enabled || s_preview.ingest_decimation == 0U ||
-        ++s_preview.ingest_phase < s_preview.ingest_decimation) {
+    if (!s_preview.ingest_enabled || s_preview.ingest_decimation == 0U) {
         return;
     }
-    s_preview.ingest_phase = 0U;
 
-    adc_preview_record_t record = {
-        .frame_index = frame_index,
-        .timestamp_us = (uint64_t)esp_timer_get_time(),
-        .channel_count = s_preview.ingest_channel_count,
-    };
-    for (size_t index = 0U; index < s_preview.ingest_channel_count; ++index) {
-        const uint8_t channel = s_preview.ingest_channels[index];
-        const size_t offset = 4U + (size_t)channel * 4U;
-        record.samples[index].channel = channel;
-        record.samples[index].value =
-            ((uint16_t)frame[offset] << 8U) | frame[offset + 1U];
+    const uint32_t decimation = s_preview.ingest_decimation;
+    const uint32_t initial_phase = s_preview.ingest_phase;
+    size_t selected_offset = (size_t)(decimation - initial_phase - 1U);
+    while (selected_offset < frame_count) {
+        const uint8_t *const frame =
+            frames + selected_offset * ADC_PREVIEW_FRAME_BYTES;
+        adc_preview_record_t record = {
+            .frame_index = first_frame_index + selected_offset,
+            .timestamp_us = (uint64_t)esp_timer_get_time(),
+            .channel_count = s_preview.ingest_channel_count,
+        };
+        for (size_t index = 0U;
+             index < s_preview.ingest_channel_count; ++index) {
+            const uint8_t channel = s_preview.ingest_channels[index];
+            const size_t offset = 4U + (size_t)channel * 4U;
+            record.samples[index].channel = channel;
+            record.samples[index].value =
+                ((uint16_t)frame[offset] << 8U) | frame[offset + 1U];
+        }
+        const bool queued =
+            xQueueSend(s_preview.queue, &record, 0) == pdTRUE;
+        portENTER_CRITICAL(&s_preview.lock);
+        if (queued) {
+            ++s_preview.produced;
+        } else {
+            ++s_preview.dropped;
+        }
+        portEXIT_CRITICAL(&s_preview.lock);
+        selected_offset += decimation;
     }
-    const bool queued = xQueueSend(s_preview.queue, &record, 0) == pdTRUE;
-    portENTER_CRITICAL(&s_preview.lock);
-    if (queued) {
-        ++s_preview.produced;
-    } else {
-        ++s_preview.dropped;
-    }
-    portEXIT_CRITICAL(&s_preview.lock);
+    s_preview.ingest_phase =
+        (uint32_t)(((uint64_t)initial_phase + frame_count) % decimation);
 }
 
 bool adc_preview_receive(adc_preview_record_t *record, TickType_t wait_ticks)

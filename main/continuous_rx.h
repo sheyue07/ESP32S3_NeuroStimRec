@@ -25,6 +25,7 @@ typedef enum {
     CONTINUOUS_RX_ERROR_ALREADY_RUNNING,
     CONTINUOUS_RX_ERROR_DMA_DESCRIPTOR,
     CONTINUOUS_RX_ERROR_DMA_OVERRUN,
+    CONTINUOUS_RX_ERROR_SPI_FIFO_OVERRUN,
     CONTINUOUS_RX_ERROR_QUEUE_FULL,
     CONTINUOUS_RX_ERROR_UNEXPECTED_EOF,
     CONTINUOUS_RX_ERROR_BLOCK_STATE,
@@ -42,6 +43,7 @@ typedef struct {
     uint64_t completed_blocks;
     uint64_t descriptor_errors;
     uint64_t overruns;
+    uint64_t spi_fifo_overruns;
     uint64_t queue_full_errors;
     uint64_t unexpected_eof_errors;
     continuous_rx_error_t first_error;

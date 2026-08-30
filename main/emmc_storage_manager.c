@@ -182,8 +182,17 @@ static append_result_t append_to_write_cache(recording_context_t *context,
         return APPEND_IO_ERROR;
     }
 
+    const uint64_t first_frame_index =
+        context->written_bytes / ADC_FRAME_SIZE_BYTES + 1U;
     const esp_err_t result = raw_sd_recorder_append(
         &raw_recorder, data, length, consumed);
+    if (*consumed != 0U) {
+        /* Preview extraction is intentionally done by the CPU1 storage task
+         * after data has been accepted for eMMC. The CPU0 frame parser stays
+         * identical to the proven capture-only hot path. */
+        adc_preview_ingest_batch(
+            data, *consumed / ADC_FRAME_SIZE_BYTES, first_frame_index);
+    }
     context->written_bytes += *consumed;
     context->interval_written_bytes += *consumed;
     if (result == ESP_OK) {
@@ -364,7 +373,6 @@ static bool validated_frame_callback(
     }
 
     const bool announce_recording = context->total_frames == 0U;
-    adc_preview_ingest_frame(frame, context->total_frames + 1U);
     memcpy(context->batch + context->batch_pos,
            frame,
            ADC_FRAME_SIZE_BYTES);
@@ -452,8 +460,13 @@ static void adc_dma_task(void *parameter)
             continuous_rx_stats_t rx_stats;
             continuous_rx_get_stats(&rx_stats);
             if (rx_stats.fatal) {
+                const esp_err_t failure =
+                    rx_stats.first_error ==
+                            CONTINUOUS_RX_ERROR_SPI_FIFO_OVERRUN
+                        ? EMMC_STORAGE_ERR_SPI_FIFO_OVERFLOW
+                        : ESP_ERR_INVALID_STATE;
                 signal_capture_failure("Continuous SPI2/GDMA receive",
-                                       ESP_ERR_INVALID_STATE);
+                                       failure);
                 (void)continuous_rx_stop();
             }
             if (!rx_stats.running) {
@@ -749,9 +762,11 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     ESP_LOGI(TAG,
              "DMA blocks=%" PRIu64 ", last_sequence=%" PRIu64
              ", sequence_gaps=%" PRIu32 ", overrun=%" PRIu64
+             ", spi_fifo_overrun=%" PRIu64
              ", descriptor_errors=%" PRIu64 ", unexpected_eof=%" PRIu64,
              rx_stats.completed_blocks, status.last_dma_sequence,
              status.dma_sequence_gaps, rx_stats.overruns,
+             rx_stats.spi_fifo_overruns,
              rx_stats.descriptor_errors, rx_stats.unexpected_eof_errors);
     ESP_LOGI(TAG,
              "SyncFrames=%" PRIu64 ", header_errors=%" PRIu64

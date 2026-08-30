@@ -42,7 +42,9 @@ esp_err_t adc_preview_configure(const uint8_t *channels,
                                 uint16_t target_hz,
                                 uint16_t *actual_hz);
 void adc_preview_disable(void);
-void adc_preview_ingest_frame(const uint8_t frame[260], uint64_t frame_index);
+void adc_preview_ingest_batch(const uint8_t *frames,
+                              size_t frame_count,
+                              uint64_t first_frame_index);
 bool adc_preview_receive(adc_preview_record_t *record, TickType_t wait_ticks);
 void adc_preview_get_status(adc_preview_status_t *status);
 

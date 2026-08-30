@@ -17,6 +17,7 @@ extern "C" {
 #define EMMC_STORAGE_ERR_RAW_OVERFLOW  ((esp_err_t)0x7110)
 #define EMMC_STORAGE_ERR_VALID_OVERFLOW ((esp_err_t)0x7111)
 #define EMMC_STORAGE_ERR_DMA_SEQUENCE  ((esp_err_t)0x7112)
+#define EMMC_STORAGE_ERR_SPI_FIFO_OVERFLOW ((esp_err_t)0x7113)
 
 #define EMMC_CAPTURE_SOURCE_BLE   (1U << 1)
 
