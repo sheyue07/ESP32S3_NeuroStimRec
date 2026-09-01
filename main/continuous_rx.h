@@ -41,6 +41,10 @@ typedef struct {
 typedef struct {
     uint64_t completed_descriptors;
     uint64_t completed_blocks;
+    /* Descriptors recovered by scanning owner bits beyond the single
+     * descriptor implied by a coalesced RX_DONE interrupt. */
+    uint64_t coalesced_descriptors;
+    uint64_t empty_done_callbacks;
     uint64_t descriptor_errors;
     uint64_t overruns;
     uint64_t spi_fifo_overruns;
@@ -48,6 +52,7 @@ typedef struct {
     uint64_t unexpected_eof_errors;
     continuous_rx_error_t first_error;
     bool running;
+    bool stopping;
     bool fatal;
 } continuous_rx_stats_t;
 

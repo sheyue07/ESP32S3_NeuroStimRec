@@ -84,6 +84,8 @@ static void emit_event(frame_sync_t *sync,
         return;
     }
     const bool fast_lock = type == FRAME_SYNC_EVENT_FAST_LOCKED;
+    const bool candidate_rejected =
+        type == FRAME_SYNC_EVENT_CANDIDATE_REJECTED;
     const frame_sync_event_t event = {
         .type = type,
         .state = sync->state,
@@ -91,8 +93,13 @@ static void emit_event(frame_sync_t *sync,
         .phase_bit_position = phase == UINT16_MAX ? UINT64_MAX : phase,
         .discard_start_bit = sync->discard_start_bit,
         .discard_end_bit = sync->stats.raw_bits,
-        .verified_frames = fast_lock ? ADC_SYNC_CONFIRM_HEADERS : 0U,
-        .validation_errors = 0U,
+        .verified_frames = fast_lock
+            ? ADC_SYNC_CONFIRM_HEADERS + ADC_SYNC_VERIFY_FRAMES
+            : candidate_rejected
+                  ? ADC_SYNC_CONFIRM_HEADERS +
+                        sync->fast_lock_verified_frames
+                  : 0U,
+        .validation_errors = candidate_rejected ? 1U : 0U,
         .longest_consecutive_errors = 0U,
         .holdover_good_frames = sync->holdover_good_frames,
         .holdover_bad_frames = sync->holdover_bad_frames,
@@ -148,6 +155,8 @@ static void clear_search_workspace(frame_sync_t *sync)
 static void begin_global_acquire(frame_sync_t *sync)
 {
     const bool from_holdover = sync->state == FRAME_SYNC_HOLDOVER;
+    const bool from_candidate_verification = sync->fast_lock_verifying;
+    const bool recovery_active = sync->ever_locked || sync->recovery_active;
     clear_search_workspace(sync);
     sync->state = FRAME_SYNC_ACQUIRE;
     sync->cohort_close_raw_byte = 0U;
@@ -156,8 +165,10 @@ static void begin_global_acquire(frame_sync_t *sync)
     sync->cohort_open = false;
     sync->frame_byte_count = 0U;
     sync->locked_skip_bytes = 0U;
-    sync->recovery_active = sync->ever_locked;
-    if (from_holdover) {
+    sync->fast_lock_verifying = false;
+    sync->fast_lock_verified_frames = 0U;
+    sync->recovery_active = recovery_active;
+    if (from_holdover || from_candidate_verification) {
         sync->state_start_bit = sync->stats.raw_bits;
         sync->unresolved_warned = false;
         if (sync->recovery_active) {
@@ -277,10 +288,11 @@ static void complete_fast_lock(frame_sync_t *sync, uint8_t current_raw_byte)
     sync->previous_raw_byte = current_raw_byte;
     sync->have_previous_raw_byte = true;
     sync->cohort_open = false;
-    sync->ever_locked = true;
-    sync->stats.last_resync_lock_bit = sync->stats.raw_bits;
-    ++sync->stats.lock_events;
-    emit_event(sync, FRAME_SYNC_EVENT_FAST_LOCKED, phase);
+    /* Eight periodic headers select the bit/byte phase, but a corrupted byte
+     * stream can accidentally reproduce headers at that interval. Keep the
+     * candidate private until complete frames also pass all padding checks. */
+    sync->fast_lock_verifying = true;
+    sync->fast_lock_verified_frames = 0U;
 }
 
 static void process_search_byte(frame_sync_t *sync, uint8_t raw_byte)
@@ -369,6 +381,36 @@ static frame_sync_error_t process_complete_locked_frame(
         }
         return FRAME_SYNC_ERROR_NONE;
     }
+    if (sync->fast_lock_verifying) {
+        sync->stats.discarded_bits += ADC_FRAME_SIZE_BITS;
+        if (sync->recovery_active) {
+            sync->stats.resync_discarded_bytes += ADC_FRAME_SIZE_BYTES;
+        }
+        if (error != FRAME_SYNC_ERROR_NONE) {
+            if (error == FRAME_SYNC_ERROR_HEADER) {
+                ++sync->stats.header_errors;
+            } else {
+                ++sync->stats.padding_errors;
+            }
+            ++sync->stats.candidate_rejections;
+            emit_event(sync, FRAME_SYNC_EVENT_CANDIDATE_REJECTED,
+                       sync->selected_phase);
+            begin_global_acquire(sync);
+            return error;
+        }
+
+        ++sync->fast_lock_verified_frames;
+        if (sync->fast_lock_verified_frames >= ADC_SYNC_VERIFY_FRAMES) {
+            sync->fast_lock_verifying = false;
+            sync->ever_locked = true;
+            sync->stats.last_resync_lock_bit = frame_end_raw_byte * 8U;
+            ++sync->stats.lock_events;
+            emit_event(sync, FRAME_SYNC_EVENT_FAST_LOCKED,
+                       sync->selected_phase);
+            sync->recovery_active = false;
+        }
+        return FRAME_SYNC_ERROR_NONE;
+    }
     if (error != FRAME_SYNC_ERROR_NONE) {
         start_holdover(sync, error, frame_end_raw_byte);
         return error;
@@ -395,7 +437,7 @@ static void account_locked_discarded_bytes(frame_sync_t *sync, size_t count)
     if (sync->recovery_active) {
         sync->stats.resync_discarded_bytes += count;
     }
-    if (sync->locked_skip_bytes == 0U) {
+    if (sync->locked_skip_bytes == 0U && !sync->fast_lock_verifying) {
         sync->recovery_active = false;
     }
 }
@@ -591,9 +633,13 @@ frame_sync_status_t frame_sync_get_status(const frame_sync_t *sync)
     status.phase_bit_position = sync->selected_phase;
     status.discard_start_bit = sync->discard_start_bit;
     status.discarded_bytes = sync->stats.resync_discarded_bytes;
-    status.verified_frames = sync->active_candidates > 0U
-                                 ? ADC_SYNC_CONFIRM_HEADERS
-                                 : 0U;
+    status.verified_frames = sync->fast_lock_verifying
+        ? ADC_SYNC_CONFIRM_HEADERS + sync->fast_lock_verified_frames
+        : sync->ever_locked
+              ? ADC_SYNC_CONFIRM_HEADERS + ADC_SYNC_VERIFY_FRAMES
+              : sync->active_candidates > 0U
+                    ? ADC_SYNC_CONFIRM_HEADERS
+                    : 0U;
     status.active_candidates = sync->active_candidates;
     status.last_lock_candidates = sync->last_lock_candidates;
     status.holdover_checked_frames = sync->holdover_checked_frames;

@@ -32,7 +32,7 @@
 
 static const char *TAG = "EMMC_MANAGER";
 
-#define NEUROSTIMREC_FIRMWARE_VERSION "2026.08.31-r2-ble-7x7-batch"
+#define NEUROSTIMREC_FIRMWARE_VERSION "2026.09.01-r4-stop-safe-dma-sync"
 #define RAW_RING_BUFFER_SIZE        (7U * 1024U * 1024U)
 #define RAW_RING_LOW_WATERMARK      (1U * 1024U * 1024U)
 #define VALID_RING_BUFFER_SIZE      (7U * 1024U * 1024U)
@@ -420,11 +420,34 @@ static void adc_dma_task(void *parameter)
             continuous_rx_stats_t rx_stats;
             continuous_rx_get_stats(&rx_stats);
             if (rx_stats.fatal) {
-                const esp_err_t failure =
-                    rx_stats.first_error ==
-                            CONTINUOUS_RX_ERROR_SPI_FIFO_OVERRUN
-                        ? EMMC_STORAGE_ERR_SPI_FIFO_OVERFLOW
-                        : ESP_ERR_INVALID_STATE;
+                esp_err_t failure = EMMC_STORAGE_ERR_CONTINUOUS_RX_UNKNOWN;
+                switch (rx_stats.first_error) {
+                case CONTINUOUS_RX_ERROR_DMA_DESCRIPTOR:
+                    failure = EMMC_STORAGE_ERR_DMA_DESCRIPTOR;
+                    break;
+                case CONTINUOUS_RX_ERROR_DMA_OVERRUN:
+                    failure = EMMC_STORAGE_ERR_DMA_OVERRUN;
+                    break;
+                case CONTINUOUS_RX_ERROR_SPI_FIFO_OVERRUN:
+                    failure = EMMC_STORAGE_ERR_SPI_FIFO_OVERFLOW;
+                    break;
+                case CONTINUOUS_RX_ERROR_QUEUE_FULL:
+                    failure = EMMC_STORAGE_ERR_DMA_QUEUE_FULL;
+                    break;
+                case CONTINUOUS_RX_ERROR_UNEXPECTED_EOF:
+                    failure = EMMC_STORAGE_ERR_DMA_UNEXPECTED_EOF;
+                    break;
+                case CONTINUOUS_RX_ERROR_BLOCK_STATE:
+                    failure = EMMC_STORAGE_ERR_DMA_BLOCK_STATE;
+                    break;
+                case CONTINUOUS_RX_ERROR_NOT_INITIALIZED:
+                case CONTINUOUS_RX_ERROR_ALREADY_RUNNING:
+                    failure = ESP_ERR_INVALID_STATE;
+                    break;
+                case CONTINUOUS_RX_ERROR_NONE:
+                default:
+                    break;
+                }
                 signal_capture_failure("Continuous SPI2/GDMA receive",
                                        failure);
                 (void)continuous_rx_stop();
@@ -685,10 +708,13 @@ static bool finish_recording(recording_context_t *context, const char *reason)
         .dma_last_sequence = status.last_dma_sequence,
         .dma_sequence_gaps = status.dma_sequence_gaps,
     };
+    const esp_err_t segment_failure = success
+        ? ESP_OK
+        : status.failure_code != ESP_OK ? status.failure_code : ESP_FAIL;
     const esp_err_t metadata_result = raw_sd_recorder_close_segment(
         &raw_recorder,
         success ? RAW_SD_SEGMENT_CLOSED : RAW_SD_SEGMENT_FAILED,
-        success ? ESP_OK : ESP_FAIL,
+        segment_failure,
         &diagnostics);
     if (metadata_result != ESP_OK) {
         success = false;
@@ -719,11 +745,13 @@ static bool finish_recording(recording_context_t *context, const char *reason)
              "DMA blocks=%" PRIu64 ", last_sequence=%" PRIu64
              ", sequence_gaps=%" PRIu32 ", overrun=%" PRIu64
              ", spi_fifo_overrun=%" PRIu64
-             ", descriptor_errors=%" PRIu64 ", unexpected_eof=%" PRIu64,
+             ", descriptor_errors=%" PRIu64 ", recovered_desc=%" PRIu64
+             ", empty_done=%" PRIu64 ", unexpected_eof=%" PRIu64,
              rx_stats.completed_blocks, status.last_dma_sequence,
              status.dma_sequence_gaps, rx_stats.overruns,
              rx_stats.spi_fifo_overruns,
-             rx_stats.descriptor_errors, rx_stats.unexpected_eof_errors);
+             rx_stats.descriptor_errors, rx_stats.coalesced_descriptors,
+             rx_stats.empty_done_callbacks, rx_stats.unexpected_eof_errors);
     ESP_LOGI(TAG,
              "SyncFrames=%" PRIu64 ", header_errors=%" PRIu64
              ", padding_errors=%" PRIu64 ", resync_events=%" PRIu64

@@ -15,6 +15,9 @@ extern "C" {
 #define ADC_SYNC_SEARCH_LANES                        8U
 #define ADC_SYNC_PHASE_COUNT                         ADC_FRAME_SIZE_BITS
 #define ADC_SYNC_CONFIRM_HEADERS                     8U
+/* A header-only phase candidate is not trusted until several complete frames
+ * also satisfy every channel padding word. */
+#define ADC_SYNC_VERIFY_FRAMES                        4U
 #define ADC_SYNC_COHORT_BYTES                        ADC_FRAME_SIZE_BYTES
 #define ADC_SYNC_HOLDOVER_MAX_FRAMES                 8U
 #define ADC_SYNC_HOLDOVER_GOOD_FRAMES                4U
@@ -90,7 +93,7 @@ typedef struct {
     uint64_t holdover_recoveries;
     uint64_t global_searches;
     uint64_t ambiguous_events;      /* Legacy counter; new code leaves it zero. */
-    uint64_t candidate_rejections;  /* Legacy counter; new code leaves it zero. */
+    uint64_t candidate_rejections;  /* Full-frame verification failures. */
     uint64_t unresolved_warnings;
     uint64_t uncertain_locks;
 } frame_sync_stats_t;
@@ -152,6 +155,8 @@ typedef struct {
     bool recovery_active;
     bool unresolved_warned;
     bool uncertain_lock_seen;
+    bool fast_lock_verifying;
+    uint8_t fast_lock_verified_frames;
 
     uint8_t frame[ADC_FRAME_SIZE_BYTES];
     uint16_t frame_byte_count;

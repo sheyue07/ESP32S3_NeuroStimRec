@@ -40,6 +40,7 @@ typedef struct {
     bool initialized;
     bool bus_claimed;
     volatile bool running;
+    volatile bool stopping;
     volatile bool fatal;
     volatile continuous_rx_error_t first_error;
     spi_slave_hal_context_t spi_hal;
@@ -55,6 +56,8 @@ typedef struct {
     volatile uint64_t block_sequence;
     volatile uint64_t completed_descriptors;
     volatile uint64_t completed_blocks;
+    volatile uint64_t coalesced_descriptors;
+    volatile uint64_t empty_done_callbacks;
     volatile uint64_t descriptor_errors;
     volatile uint64_t overruns;
     volatile uint64_t spi_fifo_overruns;
@@ -70,6 +73,14 @@ static continuous_rx_context_t s_rx = {
 static void IRAM_ATTR continuous_rx_fail_isr(continuous_rx_error_t error)
 {
     portENTER_CRITICAL_ISR(&s_rx.lock);
+    /* Stopping an externally clocked circular RX ring necessarily abandons
+     * one descriptor in progress.  GDMA may report that boundary as a
+     * descriptor/EOF condition after the stop request; it is not data loss
+     * during the requested capture interval. */
+    if (s_rx.stopping) {
+        portEXIT_CRITICAL_ISR(&s_rx.lock);
+        return;
+    }
     if (!s_rx.fatal) {
         s_rx.first_error = error;
     }
@@ -81,6 +92,10 @@ static void IRAM_ATTR continuous_rx_fail_isr(continuous_rx_error_t error)
 static void continuous_rx_fail(continuous_rx_error_t error)
 {
     portENTER_CRITICAL(&s_rx.lock);
+    if (s_rx.stopping) {
+        portEXIT_CRITICAL(&s_rx.lock);
+        return;
+    }
     if (!s_rx.fatal) {
         s_rx.first_error = error;
     }
@@ -97,6 +112,9 @@ static bool IRAM_ATTR continuous_rx_on_descriptor_error(
     (void)dma_channel;
     (void)event_data;
     (void)user_data;
+    if (!s_rx.running || s_rx.stopping) {
+        return false;
+    }
     ++s_rx.descriptor_errors;
     continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_DMA_DESCRIPTOR);
     return false;
@@ -110,7 +128,7 @@ static bool IRAM_ATTR continuous_rx_on_recv_eof(
     (void)dma_channel;
     (void)event_data;
     (void)user_data;
-    if (s_rx.running) {
+    if (s_rx.running && !s_rx.stopping) {
         ++s_rx.unexpected_eof_errors;
         continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_UNEXPECTED_EOF);
     }
@@ -126,6 +144,10 @@ static bool IRAM_ATTR continuous_rx_on_descriptor_done(
     (void)event_data;
     (void)user_data;
 
+    if (!s_rx.running || s_rx.stopping) {
+        return false;
+    }
+
     /* SPI2 has its own RX FIFO overflow flag.  A FIFO overflow loses input
      * data before GDMA writes the next descriptor, so descriptor sequence
      * counters remain continuous and cannot reveal it.  The flag is sticky;
@@ -139,39 +161,80 @@ static bool IRAM_ATTR continuous_rx_on_descriptor_done(
     }
 
     BaseType_t task_woken = pdFALSE;
-    const uint32_t descriptor_position = s_rx.descriptor_position + 1U;
-    s_rx.descriptor_position = descriptor_position % CONTINUOUS_RX_DESC_COUNT;
-    ++s_rx.completed_descriptors;
+    uint32_t harvested = 0U;
 
-    if ((descriptor_position % CONTINUOUS_RX_DESCS_PER_BLOCK) != 0U) {
-        return false;
+    /* RX_DONE is a sticky interrupt bit, not a descriptor counter. If two
+     * descriptors finish before the ISR reads and clears that bit, ESP-IDF
+     * invokes this callback only once. The RX engine returns every completed
+     * descriptor to CPU ownership, so walk from the expected descriptor until
+     * the first descriptor still owned by DMA. This preserves the real ring
+     * position even when interrupts are coalesced. */
+    while (harvested < CONTINUOUS_RX_DESC_COUNT) {
+        const uint32_t descriptor_index = s_rx.descriptor_position;
+        volatile dma_descriptor_align4_t *const descriptor =
+            &s_rx.descriptors[descriptor_index];
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (descriptor->dw0.owner != DMA_DESCRIPTOR_BUFFER_OWNER_CPU) {
+            break;
+        }
+        if (descriptor->dw0.length != descriptor->dw0.size ||
+            descriptor->dw0.size != CONTINUOUS_RX_DESC_DATA_SIZE) {
+            if (!s_rx.running || s_rx.stopping) {
+                break;
+            }
+            ++s_rx.descriptor_errors;
+            continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_DMA_DESCRIPTOR);
+            return false;
+        }
+
+        const uint32_t next_position =
+            (descriptor_index + 1U) % CONTINUOUS_RX_DESC_COUNT;
+        s_rx.descriptor_position = next_position;
+        ++s_rx.completed_descriptors;
+        ++harvested;
+
+        if ((next_position % CONTINUOUS_RX_DESCS_PER_BLOCK) != 0U) {
+            continue;
+        }
+
+        const uint8_t completed_block = (uint8_t)(
+            (next_position / CONTINUOUS_RX_DESCS_PER_BLOCK +
+             CONTINUOUS_RX_BLOCK_COUNT - 1U) % CONTINUOUS_RX_BLOCK_COUNT);
+        const uint8_t next_block =
+            (uint8_t)((completed_block + 1U) % CONTINUOUS_RX_BLOCK_COUNT);
+
+        if (s_rx.block_states[next_block] != RX_BLOCK_DMA_OWNED ||
+            s_rx.block_states[completed_block] != RX_BLOCK_DMA_OWNED) {
+            if (!s_rx.running || s_rx.stopping) {
+                return task_woken == pdTRUE;
+            }
+            ++s_rx.overruns;
+            continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_DMA_OVERRUN);
+            return false;
+        }
+
+        s_rx.block_states[completed_block] = RX_BLOCK_CPU_READY;
+        ++s_rx.completed_blocks;
+        const completed_rx_item_t completed_item = {
+            .block_index = completed_block,
+            .sequence = ++s_rx.block_sequence,
+        };
+        if (xQueueSendFromISR(s_rx.completed_queue, &completed_item,
+                              &task_woken) != pdTRUE) {
+            if (!s_rx.running || s_rx.stopping) {
+                return task_woken == pdTRUE;
+            }
+            ++s_rx.queue_full_errors;
+            continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_QUEUE_FULL);
+            return false;
+        }
     }
 
-    const uint8_t completed_block = (uint8_t)(
-        (descriptor_position / CONTINUOUS_RX_DESCS_PER_BLOCK - 1U) %
-        CONTINUOUS_RX_BLOCK_COUNT);
-    const uint8_t next_block =
-        (uint8_t)((completed_block + 1U) % CONTINUOUS_RX_BLOCK_COUNT);
-
-    if (s_rx.block_states[next_block] != RX_BLOCK_DMA_OWNED ||
-        s_rx.block_states[completed_block] != RX_BLOCK_DMA_OWNED) {
-        ++s_rx.overruns;
-        continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_DMA_OVERRUN);
-        return false;
+    if (harvested == 0U) {
+        ++s_rx.empty_done_callbacks;
+    } else if (harvested > 1U) {
+        s_rx.coalesced_descriptors += harvested - 1U;
     }
-
-    s_rx.block_states[completed_block] = RX_BLOCK_CPU_READY;
-    ++s_rx.completed_blocks;
-    const completed_rx_item_t completed_item = {
-        .block_index = completed_block,
-        .sequence = ++s_rx.block_sequence,
-    };
-    if (xQueueSendFromISR(s_rx.completed_queue, &completed_item, &task_woken) != pdTRUE) {
-        ++s_rx.queue_full_errors;
-        continuous_rx_fail_isr(CONTINUOUS_RX_ERROR_QUEUE_FULL);
-        return false;
-    }
-
     return task_woken == pdTRUE;
 }
 
@@ -216,12 +279,15 @@ static void continuous_rx_reset_runtime_state(void)
     s_rx.block_sequence = 0;
     s_rx.completed_descriptors = 0;
     s_rx.completed_blocks = 0;
+    s_rx.coalesced_descriptors = 0;
+    s_rx.empty_done_callbacks = 0;
     s_rx.descriptor_errors = 0;
     s_rx.overruns = 0;
     s_rx.spi_fifo_overruns = 0;
     s_rx.queue_full_errors = 0;
     s_rx.unexpected_eof_errors = 0;
     s_rx.first_error = CONTINUOUS_RX_ERROR_NONE;
+    s_rx.stopping = false;
     s_rx.fatal = false;
     for (size_t block = 0; block < CONTINUOUS_RX_BLOCK_COUNT; ++block) {
         s_rx.block_states[block] = RX_BLOCK_DMA_OWNED;
@@ -294,7 +360,9 @@ esp_err_t continuous_rx_init(void)
     }
 
     const gdma_strategy_config_t strategy = {
-        .owner_check = false,
+        /* Stop instead of silently overwriting a block that the CPU has not
+         * returned yet. continuous_rx_release_block() restores ownership. */
+        .owner_check = true,
         .auto_update_desc = false,
         .eof_till_data_popped = true,
     };
@@ -406,7 +474,10 @@ esp_err_t continuous_rx_stop(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    portENTER_CRITICAL(&s_rx.lock);
+    s_rx.stopping = true;
     s_rx.running = false;
+    portEXIT_CRITICAL(&s_rx.lock);
     continuous_rx_route_cs(false);
     spi_ll_dma_rx_enable(s_rx.spi_hal.hw, false);
     const esp_err_t result = gdma_stop(s_rx.dma_channel);
@@ -450,6 +521,19 @@ esp_err_t continuous_rx_release_block(uint8_t block_index)
         continuous_rx_fail(CONTINUOUS_RX_ERROR_BLOCK_STATE);
         return ESP_ERR_INVALID_STATE;
     }
+    const size_t first_descriptor =
+        (size_t)block_index * CONTINUOUS_RX_DESCS_PER_BLOCK;
+    for (size_t node = 0U; node < CONTINUOUS_RX_DESCS_PER_BLOCK; ++node) {
+        dma_descriptor_align4_t *const descriptor =
+            &s_rx.descriptors[first_descriptor + node];
+        descriptor->dw0.length = 0U;
+        descriptor->dw0.err_eof = 0U;
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        /* Owner is written last: once DMA sees this value the descriptor is
+         * fully initialized for the next traversal of the circular list. */
+        descriptor->dw0.owner = DMA_DESCRIPTOR_BUFFER_OWNER_DMA;
+    }
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     s_rx.block_states[block_index] = RX_BLOCK_DMA_OWNED;
     return ESP_OK;
 }
@@ -463,6 +547,8 @@ void continuous_rx_get_stats(continuous_rx_stats_t *stats)
     *stats = (continuous_rx_stats_t) {
         .completed_descriptors = s_rx.completed_descriptors,
         .completed_blocks = s_rx.completed_blocks,
+        .coalesced_descriptors = s_rx.coalesced_descriptors,
+        .empty_done_callbacks = s_rx.empty_done_callbacks,
         .descriptor_errors = s_rx.descriptor_errors,
         .overruns = s_rx.overruns,
         .spi_fifo_overruns = s_rx.spi_fifo_overruns,
@@ -470,6 +556,7 @@ void continuous_rx_get_stats(continuous_rx_stats_t *stats)
         .unexpected_eof_errors = s_rx.unexpected_eof_errors,
         .first_error = s_rx.first_error,
         .running = s_rx.running,
+        .stopping = s_rx.stopping,
         .fatal = s_rx.fatal,
     };
     portEXIT_CRITICAL(&s_rx.lock);

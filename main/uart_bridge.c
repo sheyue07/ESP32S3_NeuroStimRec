@@ -375,14 +375,16 @@ static esp_err_t command_list(emmc_storage_access_t *access)
                       " state=%s run=%" PRIu32 " start_lba=%" PRIu64
                       " physical=%" PRIu64 " valid=%" PRIu64
                       " frames=%" PRIu64 " data_crc=%08" PRIX32
-                      " outcome=%" PRIu32 " events=%" PRIu32,
+                      " outcome=%" PRIu32 " events=%" PRIu32
+                      " event_overflow=%" PRIu32 " failure=0x%" PRIX32,
                       index, segment.segment_id,
                       segment_state_name(segment.state), segment.run_id,
                       segment.start_lba,
                       segment.physical_bytes, segment.valid_bytes,
                       segment.frame_count, segment.data_checksum,
                       segment.capture_outcome,
-                      segment.event_count);
+                      segment.event_count, segment.event_overflow,
+                      segment.failure_code);
         } else {
             uart_line("SEG index=%" PRIu32 " invalid=1 code=0x%x",
                       index, (unsigned int)result);
