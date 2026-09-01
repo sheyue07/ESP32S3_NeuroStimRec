@@ -11,7 +11,7 @@ extern "C" {
 #define BLE_PROTOCOL_VERSION 1U
 #define BLE_PROTOCOL_HEADER_BYTES 10U
 #define BLE_PROTOCOL_DEFAULT_PACKET_BYTES 20U
-#define BLE_PROTOCOL_MAX_PAYLOAD_BYTES 64U
+#define BLE_PROTOCOL_MAX_PAYLOAD_BYTES 172U
 #define BLE_PROTOCOL_MAX_FRAGMENTS 8U
 
 typedef enum {
@@ -30,6 +30,7 @@ typedef enum {
     BLE_MSG_STIMULATION_ACK = 0x86,
     BLE_MSG_ERROR = 0x87,
     BLE_MSG_PREVIEW_DATA = 0x90,
+    BLE_MSG_PREVIEW_BATCH = 0x91,
 } ble_protocol_message_type_t;
 
 typedef struct {

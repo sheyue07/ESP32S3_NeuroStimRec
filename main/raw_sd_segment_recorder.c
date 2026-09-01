@@ -56,6 +56,45 @@ static esp_err_t write_active_segment(raw_sd_recorder_t *recorder)
         recorder->active_directory_lba, 1U);
 }
 
+static esp_err_t read_metadata_sector(raw_sd_recorder_t *recorder,
+                                      uint32_t lba, void *destination)
+{
+    const esp_err_t result = sdmmc_read_sectors(
+        &recorder->card, recorder->write_buffer, lba, 1U);
+    if (result == ESP_OK) {
+        memcpy(destination, recorder->write_buffer, RAW_SD_SECTOR_BYTES);
+    }
+    return result;
+}
+
+static esp_err_t load_latest_superblock(raw_sd_recorder_t *recorder,
+                                        raw_sd_superblock_t *superblock)
+{
+    raw_sd_superblock_t copy_a;
+    raw_sd_superblock_t copy_b;
+    const esp_err_t result_a = read_metadata_sector(
+        recorder, RAW_SD_SUPERBLOCK_LBA_A, &copy_a);
+    const esp_err_t result_b = read_metadata_sector(
+        recorder, RAW_SD_SUPERBLOCK_LBA_B, &copy_b);
+    const bool valid_a = result_a == ESP_OK &&
+                         raw_sd_superblock_is_valid(&copy_a);
+    const bool valid_b = result_b == ESP_OK &&
+                         raw_sd_superblock_is_valid(&copy_b);
+    if (!valid_a && !valid_b) {
+        if (result_a != ESP_OK) {
+            return result_a;
+        }
+        if (result_b != ESP_OK) {
+            return result_b;
+        }
+        return ESP_ERR_INVALID_CRC;
+    }
+    *superblock = valid_b && (!valid_a || copy_b.generation > copy_a.generation)
+                      ? copy_b
+                      : copy_a;
+    return ESP_OK;
+}
+
 static esp_err_t write_data_block(raw_sd_recorder_t *recorder,
                                   const uint8_t *data, size_t bytes)
 {
@@ -280,6 +319,136 @@ esp_err_t raw_sd_recorder_begin_run(raw_sd_recorder_t *recorder)
              "Old catalog cleared; new eMMC run overwrites from LBA%" PRIu32,
              RAW_SD_DATA_START_LBA);
     return write_superblocks(recorder);
+}
+
+esp_err_t raw_sd_recorder_resume_run(raw_sd_recorder_t *recorder)
+{
+    if (recorder == NULL || !recorder->card_initialized ||
+        recorder->segment_open) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    raw_sd_superblock_t superblock;
+    esp_err_t result = load_latest_superblock(recorder, &superblock);
+    if (result != ESP_OK) {
+        return result;
+    }
+    if (superblock.data_start_lba != RAW_SD_DATA_START_LBA ||
+        superblock.data_capacity_sectors != recorder->data_capacity_sectors ||
+        superblock.directory_capacity != RAW_SD_SEGMENT_DIRECTORY_CAPACITY ||
+        superblock.event_area_start_lba != RAW_SD_EVENT_AREA_START_LBA ||
+        superblock.segment_count > RAW_SD_SEGMENT_DIRECTORY_CAPACITY) {
+        ESP_LOGE(TAG, "Existing eMMC catalog layout is incompatible");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint64_t expected_lba = RAW_SD_DATA_START_LBA;
+    uint64_t physical_bytes = 0U;
+    uint64_t valid_bytes = 0U;
+    uint32_t closed_segments = 0U;
+    uint32_t next_event_lba = RAW_SD_EVENT_AREA_START_LBA;
+    bool recovered_open_segment = false;
+
+    for (uint32_t index = 0U; index < superblock.segment_count; ++index) {
+        raw_sd_segment_t segment;
+        result = read_metadata_sector(
+            recorder, RAW_SD_SEGMENT_DIRECTORY_START_LBA + index, &segment);
+        if (result != ESP_OK) {
+            return result;
+        }
+        if (!raw_sd_segment_is_valid(&segment) ||
+            segment.segment_id != index + 1U ||
+            segment.run_id != superblock.run_id ||
+            segment.start_lba != expected_lba ||
+            (segment.state != RAW_SD_SEGMENT_OPEN &&
+             segment.state != RAW_SD_SEGMENT_CLOSED &&
+             segment.state != RAW_SD_SEGMENT_FAILED) ||
+            segment.physical_bytes % RAW_SD_SECTOR_BYTES != 0U ||
+            segment.valid_bytes > segment.physical_bytes ||
+            segment.valid_bytes % RAW_SD_FRAME_BYTES != 0U) {
+            ESP_LOGE(TAG, "Invalid eMMC directory entry at index %" PRIu32,
+                     index);
+            return ESP_ERR_INVALID_CRC;
+        }
+
+        const uint64_t segment_sectors =
+            segment.physical_bytes / RAW_SD_SECTOR_BYTES;
+        if (expected_lba > recorder->data_end_lba ||
+            segment_sectors > recorder->data_end_lba - expected_lba) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        expected_lba += segment_sectors;
+        physical_bytes += segment.physical_bytes;
+        valid_bytes += segment.valid_bytes;
+        if (segment.state == RAW_SD_SEGMENT_CLOSED) {
+            closed_segments++;
+        }
+        if (segment.event_sector_count != 0U) {
+            const uint64_t event_end =
+                (uint64_t)segment.event_start_lba +
+                segment.event_sector_count;
+            if (event_end > RAW_SD_EVENT_AREA_END_LBA) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            if (event_end > next_event_lba) {
+                next_event_lba = (uint32_t)event_end;
+            }
+        }
+
+        if (segment.state == RAW_SD_SEGMENT_OPEN) {
+            /* A reset can leave the last checkpoint OPEN. Preserve every
+             * committed complete frame, close that slot as failed, then put
+             * the next capture after it. At most the uncheckpointed tail is
+             * overwritten; earlier captures are never discarded. */
+            if (index + 1U != superblock.segment_count) {
+                return ESP_ERR_INVALID_STATE;
+            }
+            segment.state = RAW_SD_SEGMENT_FAILED;
+            segment.capture_outcome = RAW_SD_CAPTURE_FAILED_PIPELINE;
+            segment.failure_code = (uint32_t)ESP_ERR_INVALID_STATE;
+            segment.end_time_us = (uint64_t)esp_timer_get_time();
+            segment.metadata_generation = superblock.generation + 1U;
+            raw_sd_segment_finalize(&segment);
+            memcpy(recorder->write_buffer, &segment, sizeof(segment));
+            result = sdmmc_write_sectors(
+                &recorder->card, recorder->write_buffer,
+                RAW_SD_SEGMENT_DIRECTORY_START_LBA + index, 1U);
+            if (result != ESP_OK) {
+                return result;
+            }
+            recovered_open_segment = true;
+        }
+    }
+
+    recorder->superblock = superblock;
+    recorder->superblock.state = RAW_SD_RUN_RUNNING;
+    recorder->superblock.failure_code = 0U;
+    recorder->superblock.closed_segment_count = closed_segments;
+    recorder->superblock.physical_bytes_written = physical_bytes;
+    recorder->superblock.valid_bytes_written = valid_bytes;
+    recorder->superblock.next_event_lba = next_event_lba;
+    recorder->next_write_lba = expected_lba;
+    recorder->write_buffer_used = 0U;
+    recorder->active_pending_valid_bytes = 0U;
+    recorder->next_metadata_bytes = 0U;
+    recorder->segment_open = false;
+    recorder->run_full = expected_lba >= recorder->data_end_lba ||
+        superblock.segment_count >= RAW_SD_SEGMENT_DIRECTORY_CAPACITY;
+
+    result = write_superblocks(recorder);
+    if (result != ESP_OK) {
+        return result;
+    }
+    ESP_LOGI(TAG,
+             "Resumed eMMC run=%" PRIu32 ": segments=%" PRIu32
+             ", next_lba=%" PRIu64 ", remaining=%" PRIu64 " bytes%s",
+             recorder->superblock.run_id,
+             recorder->superblock.segment_count,
+             recorder->next_write_lba,
+             raw_sd_recorder_remaining_capacity_bytes(recorder),
+             recovered_open_segment ? ", recovered interrupted OPEN segment"
+                                    : "");
+    return ESP_OK;
 }
 
 esp_err_t raw_sd_recorder_open_segment(raw_sd_recorder_t *recorder)

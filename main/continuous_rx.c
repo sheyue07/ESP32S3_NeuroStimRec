@@ -21,6 +21,10 @@
 #define CONTINUOUS_RX_DESC_COUNT \
     (CONTINUOUS_RX_BLOCK_COUNT * CONTINUOUS_RX_DESCS_PER_BLOCK)
 
+_Static_assert(
+    (CONTINUOUS_RX_BLOCK_SIZE % CONTINUOUS_RX_DESC_DATA_SIZE) == 0U,
+    "each logical RX block must use only full-sized GDMA descriptors");
+
 typedef enum {
     RX_BLOCK_DMA_OWNED,
     RX_BLOCK_CPU_READY,

@@ -27,6 +27,7 @@ typedef struct {
     uint32_t ingest_generation;
     uint32_t ingest_phase;
     uint32_t ingest_decimation;
+    uint16_t ingest_actual_hz;
     bool ingest_enabled;
     uint8_t ingest_channel_count;
     uint8_t ingest_channels[ADC_PREVIEW_MAX_CHANNELS];
@@ -121,6 +122,7 @@ void adc_preview_ingest_batch(const uint8_t *frames,
         s_preview.ingest_generation = s_preview.generation;
         s_preview.ingest_enabled = s_preview.enabled;
         s_preview.ingest_decimation = s_preview.decimation;
+        s_preview.ingest_actual_hz = s_preview.actual_hz;
         s_preview.ingest_channel_count = s_preview.channel_count;
         memcpy(s_preview.ingest_channels, s_preview.channels,
                s_preview.channel_count);
@@ -140,6 +142,8 @@ void adc_preview_ingest_batch(const uint8_t *frames,
         adc_preview_record_t record = {
             .frame_index = first_frame_index + selected_offset,
             .timestamp_us = (uint64_t)esp_timer_get_time(),
+            .sample_rate_hz = s_preview.ingest_actual_hz,
+            .frame_step = (uint16_t)decimation,
             .channel_count = s_preview.ingest_channel_count,
         };
         for (size_t index = 0U;

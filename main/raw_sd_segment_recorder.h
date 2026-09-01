@@ -48,6 +48,7 @@ typedef struct {
 esp_err_t raw_sd_recorder_init(raw_sd_recorder_t *recorder);
 void raw_sd_recorder_deinit(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_begin_run(raw_sd_recorder_t *recorder);
+esp_err_t raw_sd_recorder_resume_run(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_open_segment(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_append(raw_sd_recorder_t *recorder,
                                  const uint8_t *frames,

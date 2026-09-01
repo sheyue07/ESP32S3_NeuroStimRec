@@ -35,6 +35,9 @@
 #define BLE_CONTROL_TASK_STACK 5120U
 #define BLE_CONTROL_TASK_PRIORITY 5U
 #define BLE_STATUS_INTERVAL_MS 500U
+#define BLE_PREVIEW_BATCH_FORMAT 1U
+#define BLE_PREVIEW_BATCH_HEADER_BYTES 24U
+#define BLE_PREVIEW_BATCH_MAX_LATENCY_MS 500U
 #define BLE_NOTIFY_FLAG (1U << 0)
 #define BLE_DISCONNECT_FLAG (1U << 1)
 
@@ -126,6 +129,20 @@ typedef struct {
     uint16_t notify_handle;
     bool sent;
 } notify_packet_context_t;
+
+typedef struct {
+    bool active;
+    TickType_t started_at;
+    uint64_t first_frame_index;
+    uint64_t first_timestamp_us;
+    uint16_t sample_rate_hz;
+    uint16_t frame_step;
+    uint8_t channel_count;
+    uint8_t sample_count;
+    uint8_t channels[ADC_PREVIEW_MAX_CHANNELS];
+    uint16_t values[ADC_PREVIEW_BATCH_MAX_RECORDS]
+                   [ADC_PREVIEW_MAX_CHANNELS];
+} preview_batch_context_t;
 
 static bool notify_packet(const uint8_t *packet,
                           size_t packet_length,
@@ -224,20 +241,142 @@ static void send_status(void)
     (void)send_message(BLE_MSG_STATUS, payload, sizeof(payload));
 }
 
-static void send_preview(const adc_preview_record_t *record)
+static void preview_batch_reset(preview_batch_context_t *batch)
 {
-    uint8_t payload[17U + ADC_PREVIEW_MAX_CHANNELS * 3U];
-    ble_protocol_write_u64(payload, record->frame_index);
-    ble_protocol_write_u64(payload + 8U, record->timestamp_us);
-    payload[16] = record->channel_count;
-    for (size_t index = 0U; index < record->channel_count; ++index) {
-        const size_t offset = 17U + index * 3U;
-        payload[offset] = record->samples[index].channel;
-        ble_protocol_write_u16(payload + offset + 1U,
-                               (uint16_t)record->samples[index].value);
+    if (batch != NULL) {
+        memset(batch, 0, sizeof(*batch));
     }
-    (void)send_message(BLE_MSG_PREVIEW_DATA,
-                       payload, 17U + record->channel_count * 3U);
+}
+
+static bool preview_batch_matches(const preview_batch_context_t *batch,
+                                  const adc_preview_record_t *record)
+{
+    if (!batch->active || batch->channel_count != record->channel_count ||
+        batch->sample_rate_hz != record->sample_rate_hz ||
+        batch->frame_step != record->frame_step) {
+        return false;
+    }
+    for (size_t index = 0U; index < record->channel_count; ++index) {
+        if (batch->channels[index] != record->samples[index].channel) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static size_t preview_message_payload_limit(void)
+{
+    uint16_t connection_handle;
+    if (!connection_snapshot(&connection_handle, NULL)) {
+        return 0U;
+    }
+    size_t packet_limit = BLE_PROTOCOL_DEFAULT_PACKET_BYTES;
+    const uint16_t mtu = ble_att_mtu(connection_handle);
+    if (mtu > 3U) {
+        packet_limit = mtu - 3U;
+    }
+    const size_t maximum = BLE_PROTOCOL_HEADER_BYTES +
+                           BLE_PROTOCOL_MAX_PAYLOAD_BYTES;
+    if (packet_limit > maximum) {
+        packet_limit = maximum;
+    }
+    return packet_limit > BLE_PROTOCOL_HEADER_BYTES
+               ? packet_limit - BLE_PROTOCOL_HEADER_BYTES
+               : 0U;
+}
+
+static size_t preview_batch_capacity(uint8_t channel_count,
+                                     uint16_t sample_rate_hz)
+{
+    if (channel_count == 0U) {
+        return 0U;
+    }
+    const size_t fixed_bytes = BLE_PREVIEW_BATCH_HEADER_BYTES + channel_count;
+    const size_t per_sample_bytes = (size_t)channel_count * 2U;
+    const size_t payload_limit = preview_message_payload_limit();
+    size_t capacity = payload_limit > fixed_bytes
+                          ? (payload_limit - fixed_bytes) / per_sample_bytes
+                          : 1U;
+    if (capacity == 0U) {
+        capacity = 1U;
+    }
+    if (capacity > ADC_PREVIEW_BATCH_MAX_RECORDS) {
+        capacity = ADC_PREVIEW_BATCH_MAX_RECORDS;
+    }
+    /* Bound display latency to roughly 500 ms even when one channel would
+     * allow a much larger ATT notification. */
+    size_t latency_capacity = (sample_rate_hz + 1U) / 2U;
+    if (latency_capacity == 0U) {
+        latency_capacity = 1U;
+    }
+    if (capacity > latency_capacity) {
+        capacity = latency_capacity;
+    }
+    return capacity;
+}
+
+static void preview_batch_start(preview_batch_context_t *batch,
+                                const adc_preview_record_t *record,
+                                TickType_t now)
+{
+    preview_batch_reset(batch);
+    batch->active = true;
+    batch->started_at = now;
+    batch->first_frame_index = record->frame_index;
+    batch->first_timestamp_us = record->timestamp_us;
+    batch->sample_rate_hz = record->sample_rate_hz;
+    batch->frame_step = record->frame_step;
+    batch->channel_count = record->channel_count;
+    for (size_t index = 0U; index < record->channel_count; ++index) {
+        batch->channels[index] = record->samples[index].channel;
+    }
+}
+
+static void preview_batch_append(preview_batch_context_t *batch,
+                                 const adc_preview_record_t *record)
+{
+    if (batch->sample_count >= ADC_PREVIEW_BATCH_MAX_RECORDS) {
+        return;
+    }
+    const size_t sample_index = batch->sample_count;
+    for (size_t channel = 0U; channel < record->channel_count; ++channel) {
+        batch->values[sample_index][channel] =
+            record->samples[channel].value;
+    }
+    ++batch->sample_count;
+}
+
+static void send_preview_batch(preview_batch_context_t *batch)
+{
+    if (!batch->active || batch->sample_count == 0U) {
+        preview_batch_reset(batch);
+        return;
+    }
+    uint8_t payload[BLE_PROTOCOL_MAX_PAYLOAD_BYTES] = {0};
+    payload[0] = BLE_PREVIEW_BATCH_FORMAT;
+    payload[1] = batch->channel_count;
+    payload[2] = batch->sample_count;
+    ble_protocol_write_u16(payload + 4U, batch->sample_rate_hz);
+    ble_protocol_write_u16(payload + 6U, batch->frame_step);
+    ble_protocol_write_u64(payload + 8U, batch->first_frame_index);
+    ble_protocol_write_u64(payload + 16U, batch->first_timestamp_us);
+    memcpy(payload + BLE_PREVIEW_BATCH_HEADER_BYTES,
+           batch->channels, batch->channel_count);
+
+    size_t offset = BLE_PREVIEW_BATCH_HEADER_BYTES + batch->channel_count;
+    for (size_t sample = 0U; sample < batch->sample_count; ++sample) {
+        for (size_t channel = 0U; channel < batch->channel_count; ++channel) {
+            if (offset + 2U > sizeof(payload)) {
+                preview_batch_reset(batch);
+                return;
+            }
+            ble_protocol_write_u16(payload + offset,
+                                   batch->values[sample][channel]);
+            offset += 2U;
+        }
+    }
+    (void)send_message(BLE_MSG_PREVIEW_BATCH, payload, offset);
+    preview_batch_reset(batch);
 }
 
 static void send_preview_ack(const ble_preview_config_command_t *preview,
@@ -379,9 +518,11 @@ static void ble_control_task(void *parameter)
     (void)parameter;
     uint32_t notifications = 0U;
     TickType_t last_status = xTaskGetTickCount();
+    preview_batch_context_t preview_batch = {0};
     for (;;) {
         (void)xTaskNotifyWait(0U, UINT32_MAX, &notifications, 0);
         if ((notifications & BLE_DISCONNECT_FLAG) != 0U) {
+            preview_batch_reset(&preview_batch);
             adc_preview_disable();
             (void)emmc_storage_set_capture_request(
                 EMMC_CAPTURE_SOURCE_BLE, false);
@@ -395,11 +536,35 @@ static void ble_control_task(void *parameter)
         adc_preview_record_t preview;
         if (connection_snapshot(NULL, NULL) &&
             adc_preview_receive(&preview, pdMS_TO_TICKS(10))) {
-            send_preview(&preview);
+            const TickType_t now = xTaskGetTickCount();
+            if (preview_batch.active &&
+                !preview_batch_matches(&preview_batch, &preview)) {
+                /* Configuration changed. Do not deliver stale channels after
+                 * the new configuration ACK. */
+                preview_batch_reset(&preview_batch);
+            }
+            if (!preview_batch.active) {
+                preview_batch_start(&preview_batch, &preview, now);
+            }
+            preview_batch_append(&preview_batch, &preview);
+            if (preview_batch.sample_count >=
+                preview_batch_capacity(preview_batch.channel_count,
+                                       preview_batch.sample_rate_hz)) {
+                send_preview_batch(&preview_batch);
+            }
         } else {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
         const TickType_t now = xTaskGetTickCount();
+        adc_preview_status_t preview_status;
+        adc_preview_get_status(&preview_status);
+        if (preview_batch.active && !preview_status.enabled) {
+            preview_batch_reset(&preview_batch);
+        } else if (preview_batch.active &&
+                   now - preview_batch.started_at >=
+                       pdMS_TO_TICKS(BLE_PREVIEW_BATCH_MAX_LATENCY_MS)) {
+            send_preview_batch(&preview_batch);
+        }
         if (connection_snapshot(NULL, NULL) &&
             now - last_status >= pdMS_TO_TICKS(BLE_STATUS_INTERVAL_MS)) {
             send_status();

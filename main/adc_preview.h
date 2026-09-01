@@ -13,6 +13,7 @@ extern "C" {
 
 #define ADC_PREVIEW_MAX_CHANNELS 8U
 #define ADC_PREVIEW_QUEUE_DEPTH 8U
+#define ADC_PREVIEW_BATCH_MAX_RECORDS 50U
 
 typedef struct {
     uint8_t channel;
@@ -22,6 +23,8 @@ typedef struct {
 typedef struct {
     uint64_t frame_index;
     uint64_t timestamp_us;
+    uint16_t sample_rate_hz;
+    uint16_t frame_step;
     uint8_t channel_count;
     adc_preview_sample_t samples[ADC_PREVIEW_MAX_CHANNELS];
 } adc_preview_record_t;

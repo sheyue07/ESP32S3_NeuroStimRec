@@ -17,7 +17,7 @@ extern "C" {
 #define CONTINUOUS_RX_CLOCK_HZ       30000000U
 #define CONTINUOUS_RX_BLOCK_COUNT    4U
 /* Keep the original 32 KiB blocks to absorb scheduler and eMMC latency. */
-#define CONTINUOUS_RX_BLOCK_SIZE     32768U
+#define CONTINUOUS_RX_BLOCK_SIZE     32736U
 
 typedef enum {
     CONTINUOUS_RX_ERROR_NONE,

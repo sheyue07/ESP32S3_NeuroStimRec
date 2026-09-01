@@ -2,8 +2,8 @@
  * Unified ESP32-S3 ADC capture and raw eMMC storage manager.
  *
  * GPIO20 external clock + GPIO16 serial data (rising-edge sample, MSB first)
- * -> SPI2/GDMA cyclic internal buffers -> 2 MiB raw PSRAM ring
- * -> byte-oriented 260-byte frame synchronizer -> 12 MiB valid PSRAM ring
+ * -> SPI2/GDMA cyclic internal buffers -> 7 MiB raw PSRAM ring
+ * -> byte-oriented 260-byte frame synchronizer -> 7 MiB valid PSRAM ring
  * -> 64 KiB SDMMC DMA cache -> raw eMMC user-area segmented data region.
  */
 
@@ -17,6 +17,7 @@
 #include "continuous_rx.h"
 #include "emmc_storage_manager.h"
 #include "esp_err.h"
+#include "esp_attr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -31,8 +32,10 @@
 
 static const char *TAG = "EMMC_MANAGER";
 
-#define RAW_RING_BUFFER_SIZE        (2U * 1024U * 1024U)
-#define VALID_RING_BUFFER_SIZE      (12U * 1024U * 1024U)
+#define NEUROSTIMREC_FIRMWARE_VERSION "2026.08.31-r2-ble-7x7-batch"
+#define RAW_RING_BUFFER_SIZE        (7U * 1024U * 1024U)
+#define RAW_RING_LOW_WATERMARK      (1U * 1024U * 1024U)
+#define VALID_RING_BUFFER_SIZE      (7U * 1024U * 1024U)
 #define FRAME_BATCH_FRAMES          125U
 #define FRAME_BATCH_SIZE            (FRAME_BATCH_FRAMES * ADC_FRAME_SIZE_BYTES)
 #define RATE_LOG_INTERVAL_US        UINT64_C(1000000)
@@ -43,6 +46,7 @@ static const char *TAG = "EMMC_MANAGER";
 #define SYNC_EVENT_CAPACITY \
     ((RAW_SD_EVENT_AREA_END_LBA - RAW_SD_EVENT_AREA_START_LBA) * \
      RAW_SD_EVENTS_PER_SECTOR)
+#define STORAGE_POWER_SESSION_COOKIE UINT64_C(0x4E5352454D4D4302)
 
 typedef enum {
     APPEND_OK,
@@ -79,6 +83,12 @@ typedef struct {
     size_t batch_pos;
     uint64_t total_frames;
 } parser_output_context_t;
+
+typedef struct {
+    uint64_t cookie;
+    uint32_t replacement_pending;
+    uint32_t reserved;
+} storage_power_session_t;
 
 typedef enum {
     STORAGE_REQUEST_START_WRITE,
@@ -123,6 +133,8 @@ static int64_t recording_start_us;
 static uint32_t last_capture_outcome;
 static uint32_t last_sync_state;
 static uint64_t capture_frame_limit;
+static RTC_NOINIT_ATTR storage_power_session_t storage_power_session;
+static bool replace_run_on_next_capture;
 
 static void reset_capture_status(void)
 {
@@ -295,64 +307,6 @@ static void frame_sync_event_callback(const frame_sync_event_t *event,
     } else {
         ++sync_event_overflow;
     }
-
-    switch (event->type) {
-    case FRAME_SYNC_EVENT_FAST_LOCKED:
-        if (event->active_candidates > 1U) {
-            if (event->recovery) {
-                ESP_LOGW(TAG,
-                         "SYNC RELOCKED UNCERTAIN: candidates=%u, "
-                         "selected=first, phase=%" PRIu64
-                         ", shift=%u, raw_bit=%" PRIu64,
-                         event->active_candidates,
-                         event->phase_bit_position, event->bit_shift,
-                         event->raw_bit_position);
-            } else {
-                ESP_LOGW(TAG,
-                         "SYNC LOCKED UNCERTAIN: candidates=%u, "
-                         "selected=first, phase=%" PRIu64
-                         ", shift=%u, raw_bit=%" PRIu64,
-                         event->active_candidates,
-                         event->phase_bit_position, event->bit_shift,
-                         event->raw_bit_position);
-            }
-        } else {
-            ESP_LOGI(TAG,
-                     "%s: candidates=1, phase=%" PRIu64
-                     ", shift=%u, raw_bit=%" PRIu64,
-                     event->recovery ? "SYNC RELOCKED" : "SYNC LOCKED",
-                     event->phase_bit_position, event->bit_shift,
-                     event->raw_bit_position);
-        }
-        break;
-    case FRAME_SYNC_EVENT_HOLDOVER_STARTED:
-        ESP_LOGW(TAG,
-                 "HOLDOVER STARTED: raw_bit=%" PRIu64
-                 ", preserving 2080-bit phase",
-                 event->raw_bit_position);
-        break;
-    case FRAME_SYNC_EVENT_HOLDOVER_RECOVERED:
-        ESP_LOGW(TAG,
-                 "HOLDOVER RECOVERED: good=%u, bad=%u, gap_bits=%" PRIu64,
-                 event->holdover_good_frames, event->holdover_bad_frames,
-                 event->discard_end_bit - event->discard_start_bit);
-        break;
-    case FRAME_SYNC_EVENT_HOLDOVER_FAILED:
-        ESP_LOGW(TAG,
-                 "GLOBAL SYNC SEARCH: holdover checked=%u, bad=%u",
-                 event->holdover_good_frames +
-                     event->holdover_bad_frames - 1U,
-                 event->holdover_bad_frames);
-        break;
-    case FRAME_SYNC_EVENT_UNRESOLVED:
-        ESP_LOGW(TAG,
-                 "SYNC UNRESOLVED: no fast lock for 10 seconds; "
-                 "DMA remains active, candidates=%u",
-                 event->active_candidates);
-        break;
-    default:
-        break;
-    }
 }
 
 static bool validated_frame_callback(
@@ -446,6 +400,12 @@ static void adc_dma_task(void *parameter)
                     xSemaphoreGive(recording_mutex);
                     signal_capture_failure("raw PSRAM ring overflow",
                                            EMMC_STORAGE_ERR_RAW_OVERFLOW);
+                    (void)continuous_rx_stop();
+                } else if (xRingbufferGetCurFreeSize(raw_ringbuf) <
+                           RAW_RING_LOW_WATERMARK) {
+                    signal_capture_failure(
+                        "raw PSRAM ring reached safety watermark",
+                        EMMC_STORAGE_ERR_RAW_OVERFLOW);
                     (void)continuous_rx_stop();
                 }
 
@@ -546,13 +506,9 @@ static void frame_parser_task(void *parameter)
                 vRingbufferReturnItem(raw_ringbuf, item);
                 publish_parser_progress(&output);
                 ++processed_blocks;
-                /* Yield only when the parser is comfortably caught up.  The
-                 * old unconditional 1 ms delay every 256 KiB made a small
-                 * permanent throughput deficit accumulate until the 2 MiB
-                 * raw ring overflowed during longer BLE captures. */
-                if ((processed_blocks & 31U) == 0U &&
-                    xRingbufferGetCurFreeSize(raw_ringbuf) >
-                        (RAW_RING_BUFFER_SIZE * 3U) / 4U) {
+                /* Match the five-minute SD validation: keep IDLE0 serviceable
+                 * while avoiding frequent parser downtime. */
+                if ((processed_blocks & 63U) == 0U) {
                     vTaskDelay(1);
                 }
                 continue;
@@ -1003,11 +959,14 @@ static esp_err_t rebuild_card_and_receiver(void)
 static esp_err_t start_capture(void)
 {
     if (!run_started) {
-        const esp_err_t begin_result =
-            raw_sd_recorder_begin_run(&raw_recorder);
+        const esp_err_t begin_result = replace_run_on_next_capture
+            ? raw_sd_recorder_begin_run(&raw_recorder)
+            : raw_sd_recorder_resume_run(&raw_recorder);
         if (begin_result != ESP_OK) {
             return begin_result;
         }
+        replace_run_on_next_capture = false;
+        storage_power_session.replacement_pending = 0U;
         run_started = true;
     }
     if (raw_sd_recorder_run_is_full(&raw_recorder)) {
@@ -1267,6 +1226,24 @@ esp_err_t emmc_storage_manager_init(void)
     }
     ESP_LOGI(TAG, "ESP32-S3 continuous external-clock ADC logger starting");
     ESP_LOGI(TAG,
+             "FIRMWARE %s | raw=%u MiB valid=%u MiB parser=P19 block=%u",
+             NEUROSTIMREC_FIRMWARE_VERSION,
+             (unsigned int)(RAW_RING_BUFFER_SIZE / (1024U * 1024U)),
+             (unsigned int)(VALID_RING_BUFFER_SIZE / (1024U * 1024U)),
+             (unsigned int)CONTINUOUS_RX_BLOCK_SIZE);
+    if (storage_power_session.cookie != STORAGE_POWER_SESSION_COOKIE) {
+        storage_power_session.cookie = STORAGE_POWER_SESSION_COOKIE;
+        storage_power_session.replacement_pending = 1U;
+        storage_power_session.reserved = 0U;
+    }
+    replace_run_on_next_capture =
+        storage_power_session.replacement_pending != 0U;
+    ESP_LOGI(TAG, "%s eMMC session: next capture will %s",
+             replace_run_on_next_capture ? "New power" : "Warm reset",
+             replace_run_on_next_capture
+                 ? "replace the previous catalog"
+                 : "resume after the previous segment");
+    ESP_LOGI(TAG,
              "Capture input: CLK=GPIO%d, DATA=GPIO%d, %u Hz",
              CONTINUOUS_RX_CLK_GPIO,
              CONTINUOUS_RX_DATA_GPIO,
@@ -1323,7 +1300,7 @@ esp_err_t emmc_storage_manager_init(void)
         VALID_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (raw_ring_structure == NULL || valid_ring_structure == NULL ||
         raw_ring_storage == NULL || valid_ring_storage == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate 2 MiB raw + 12 MiB valid PSRAM rings");
+        ESP_LOGE(TAG, "Failed to allocate 7 MiB raw + 7 MiB valid PSRAM rings");
         heap_caps_free(raw_ring_structure);
         heap_caps_free(valid_ring_structure);
         heap_caps_free(raw_ring_storage);
@@ -1393,8 +1370,8 @@ esp_err_t emmc_storage_manager_init(void)
     ESP_LOGI(TAG, "Continuous GDMA ring ready: %u x %u bytes",
              CONTINUOUS_RX_BLOCK_COUNT, CONTINUOUS_RX_BLOCK_SIZE);
     ESP_LOGI(TAG,
-             "FreeRTOS pipeline: DMA(CPU0/P20) -> raw 2 MiB -> "
-             "parser(CPU0/P10) -> valid 12 MiB -> eMMC(CPU1/P6)");
+             "FreeRTOS pipeline: DMA(CPU0/P20) -> raw 7 MiB -> "
+             "parser(CPU0/P19) -> valid 7 MiB -> eMMC(CPU1/P8)");
 
     /*
      * This buffer is on the ADC -> parser -> eMMC hot path. Keeping it in
@@ -1448,7 +1425,7 @@ esp_err_t emmc_storage_manager_init(void)
             "FRAME_PARSER_TASK",
             8192,
             NULL,
-            10,
+            19,
             &parser_task_handle,
             0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to create frame parser task");
