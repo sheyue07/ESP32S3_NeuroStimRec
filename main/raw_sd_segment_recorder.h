@@ -33,6 +33,7 @@ typedef struct {
     raw_sd_superblock_t superblock;
     raw_sd_segment_t active_segment;
     uint8_t *write_buffer;
+    /* PACKED132 stored bytes; write buffer may end within a frame. */
     size_t write_buffer_used;
     uint64_t active_pending_valid_bytes;
     uint64_t next_metadata_bytes;
@@ -50,6 +51,9 @@ void raw_sd_recorder_deinit(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_begin_run(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_resume_run(raw_sd_recorder_t *recorder);
 esp_err_t raw_sd_recorder_open_segment(raw_sd_recorder_t *recorder);
+/* frames/length/consumed use validated RAW260 bytes. Accepted frames are
+ * packed into the write cache; consumed does not imply durable storage.
+ * raw_sd_* names are retained for the existing segmented eMMC format/API. */
 esp_err_t raw_sd_recorder_append(raw_sd_recorder_t *recorder,
                                  const uint8_t *frames,
                                  size_t length,

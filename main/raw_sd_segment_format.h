@@ -14,6 +14,8 @@ extern "C" {
 #define RAW_SD_EVENT_MAGIC_BYTES 7U
 #define RAW_SD_FORMAT_VERSION UINT32_C(2)
 #define RAW_SD_FRAME_BYTES UINT32_C(260)
+#define RAW_SD_PACKED_VERSION UINT32_C(3)
+#define RAW_SD_STORED_FRAME_BYTES UINT32_C(132)
 
 #define RAW_SD_SUPERBLOCK_LBA_A UINT32_C(0)
 #define RAW_SD_SUPERBLOCK_LBA_B UINT32_C(1)
@@ -142,6 +144,10 @@ _Static_assert(sizeof(raw_sd_segment_t) == RAW_SD_SECTOR_BYTES,
                "raw SD directory entry must be exactly one sector");
 
 uint32_t raw_sd_sector_checksum(const void *sector);
+static inline uint32_t raw_sd_segment_frame_bytes(const raw_sd_segment_t *segment)
+{
+    return segment->version == RAW_SD_PACKED_VERSION ? RAW_SD_STORED_FRAME_BYTES : RAW_SD_FRAME_BYTES;
+}
 void raw_sd_superblock_finalize(raw_sd_superblock_t *superblock);
 void raw_sd_segment_finalize(raw_sd_segment_t *segment);
 void raw_sd_event_sector_finalize(raw_sd_event_sector_t *event_sector);

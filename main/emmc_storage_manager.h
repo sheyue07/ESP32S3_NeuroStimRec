@@ -40,17 +40,20 @@ typedef struct {
     bool card_ready;
     bool result_available;
     uint8_t capture_source_mask;
+    /* Stored bytes: physical includes sector padding; valid excludes it. */
     uint64_t physical_bytes;
     uint64_t valid_bytes;
     uint64_t frame_count;
     uint64_t target_frames;
     uint64_t target_bytes;
+    /* Receiver input bytes in RAW260 format, before frame validation/packing. */
     uint64_t raw_input_bytes;
     uint64_t dma_blocks;
     uint64_t dma_overruns;
     uint64_t raw_overflow_bytes;
     uint64_t valid_overflow_frames;
     uint32_t dma_sequence_gaps;
+    /* Legacy field: currently equals wall_elapsed_us, not SDMMC call latency. */
     uint64_t write_elapsed_us;
     uint64_t wall_elapsed_us;
     uint32_t capture_outcome;

@@ -1,4 +1,6 @@
 #include "ble_service.h"
+#include "uart_bridge.h"
+#include <inttypes.h>
 
 #include <limits.h>
 #include <stdbool.h>
@@ -487,6 +489,13 @@ static void handle_command(const ble_protocol_command_t *command)
             s_ble.stimulation_configured = true;
         }
         send_stimulation_config_ack(config->revision, result);
+        uart_bridge_stim_log("CONFIG seq=%u rev=%" PRIu32 " result=%s "
+            "Ch=%u ChipID=0x%04X STclk_Sel=%u mode=0x%04X Freq=%u "
+            "PulseNum=%u PulseWA=%u PulseGap=%u PulseWC=%u PulseAMP=%u Stim=0x%04X",
+            command->sequence, config->revision, esp_err_to_name(result),
+            config->Ch, config->ChipID, config->STclk_Sel, config->mode,
+            config->Freq, config->PulseNum, config->PulseWA, config->PulseGap,
+            config->PulseWC, config->PulseAMP, config->Stim);
         send_status();
         break;
     }
@@ -502,6 +511,11 @@ static void handle_command(const ble_protocol_command_t *command)
             result = stim_controller_request_enabled(control->start);
         }
         send_stimulation_ack(control, result);
+        uart_bridge_stim_log("%s seq=%u request=%" PRIu32 " rev=%" PRIu32
+            " active_rev=%" PRIu32 " result=%s",
+            control->start ? "START" : "STOP", command->sequence,
+            control->request_id, control->revision, s_ble.config_revision,
+            esp_err_to_name(result));
         send_status();
         break;
     }

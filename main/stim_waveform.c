@@ -313,7 +313,12 @@ static esp_err_t stim_waveform_configure_lcd_cam(void)
     lcd_ll_swap_dma_data_byte_order(dev, false);
     lcd_ll_enable_swizzle(dev, false);
     lcd_ll_set_clock_idle_level(dev, false);
-    lcd_ll_set_pixel_clock_edge(dev, true);
+    /* Match RS64: the receiver samples on SCLK rising; LCD data (MOSI/CSb)
+     * updates on SCLK falling. This HAL flag selects the SAMPLE edge,
+     * not the data-update edge. GPIO19 remains the inverse of SCLK, so
+     * data updates on mclkST rising. Verify pad timing with a scope.
+     */
+    lcd_ll_set_pixel_clock_edge(dev, false);
     lcd_ll_set_pixel_clock_prescale(dev, 2);
     /*
      * ESP32-S3 erratum LCD-239 requires ahead_cycle > 2.  Run the LCD core at

@@ -1,5 +1,20 @@
 menu "ADC eMMC controller configuration"
 
+config NEURO_CPU_MONITOR
+    bool "Enable cached dual-core CPU load monitor"
+    default y
+    depends on FREERTOS_GENERATE_RUN_TIME_STATS && FREERTOS_RUN_TIME_COUNTER_TYPE_U64 && FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER
+    help
+        Query via CPUSTAT. Never prints asynchronous UART logs.
+        Disable this for runtime-stats-only comparison; disable FreeRTOS
+        runtime statistics as well for the original uninstrumented baseline.
+
+config NEURO_CPU_MONITOR_PERIOD_MS
+    int "CPU load sampling period (ms)"
+    range 1000 10000
+    default 1000
+    depends on NEURO_CPU_MONITOR
+
 config EMMC_CTRL_UART_PORT
     int "Bridge UART port"
     range 0 2

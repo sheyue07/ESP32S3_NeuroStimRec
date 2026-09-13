@@ -45,6 +45,9 @@ esp_err_t adc_preview_configure(const uint8_t *channels,
                                 uint16_t target_hz,
                                 uint16_t *actual_hz);
 void adc_preview_disable(void);
+/* Called by the storage task with RAW260 frames, not PACKED132 bytes.
+ * frame_count counts complete 64-channel frames; first_frame_index is 1-based.
+ * A full preview queue drops preview records rather than blocking storage. */
 void adc_preview_ingest_batch(const uint8_t *frames,
                               size_t frame_count,
                               uint64_t first_frame_index);

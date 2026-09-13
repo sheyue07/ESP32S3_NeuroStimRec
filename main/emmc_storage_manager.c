@@ -1,4 +1,14 @@
 /*
+ * 任务与缓冲区归属（运行顺序与配置保持不变）：
+ * CPU0/P20 adc_dma_task：领取DMA块，复制到raw_ringbuf，再归还DMA块。
+ * CPU0/P19 frame_parser_task：消费raw_ringbuf，同步/验证RAW260，批量送data_ringbuf。
+ * CPU1/P8 storage_manager_task：消费data_ringbuf，统一执行存储读写请求和收尾。
+ * 两个PSRAM环中均为RAW260；PACKED132转换只在记录器写缓存入口完成。
+ * BLE预览在存储任务接纳数据后抽取，接纳不等于已经全部落盘。
+ * 停止时必须保留“停止接收、等待DMA、边排空边等待解析、写尾部”的顺序。
+ */
+
+/*
  * Unified ESP32-S3 ADC capture and raw eMMC storage manager.
  *
  * GPIO20 external clock + GPIO16 serial data (rising-edge sample, MSB first)
@@ -32,7 +42,7 @@
 
 static const char *TAG = "EMMC_MANAGER";
 
-#define NEUROSTIMREC_FIRMWARE_VERSION "2026.09.01-r4-stop-safe-dma-sync"
+#define NEUROSTIMREC_FIRMWARE_VERSION "2026.09.10-r9-stim-log"
 #define RAW_RING_BUFFER_SIZE        (7U * 1024U * 1024U)
 #define RAW_RING_LOW_WATERMARK      (1U * 1024U * 1024U)
 #define VALID_RING_BUFFER_SIZE      (7U * 1024U * 1024U)
@@ -55,8 +65,8 @@ typedef enum {
 } append_result_t;
 
 typedef struct {
-    uint64_t written_bytes;
-    uint64_t interval_written_bytes;
+    /* RAW260 bytes accepted by the recorder, including cached, unflushed data. */
+    uint64_t consumed_raw_bytes;
     uint64_t last_input_bytes;
     uint64_t last_valid_frames;
     uint64_t last_physical_bytes;
@@ -105,13 +115,16 @@ typedef struct {
     esp_err_t *result;
 } storage_request_t;
 
+/* 单生产者/单消费者：DMA任务 -> raw环 -> 解析任务 -> valid环 -> 存储任务。 */
 static RingbufHandle_t raw_ringbuf;
 static RingbufHandle_t data_ringbuf;
+/* recording_mutex保护采集快照；status_mutex保护对外存储状态。 */
 static SemaphoreHandle_t recording_mutex;
 static SemaphoreHandle_t dma_stopped_sem;
 static SemaphoreHandle_t parser_stopped_sem;
 static TaskHandle_t dma_task_handle;
 static TaskHandle_t parser_task_handle;
+/* 初始化结束后，卡访问及记录器修改由存储管理任务统一执行。 */
 static raw_sd_recorder_t raw_recorder;
 static frame_sync_t stream_sync;
 static capture_status_t capture_status;
@@ -195,7 +208,7 @@ static append_result_t append_to_write_cache(recording_context_t *context,
     }
 
     const uint64_t first_frame_index =
-        context->written_bytes / ADC_FRAME_SIZE_BYTES + 1U;
+        context->consumed_raw_bytes / ADC_FRAME_SIZE_BYTES + 1U;
     const esp_err_t result = raw_sd_recorder_append(
         &raw_recorder, data, length, consumed);
     if (*consumed != 0U) {
@@ -205,8 +218,7 @@ static append_result_t append_to_write_cache(recording_context_t *context,
         adc_preview_ingest_batch(
             data, *consumed / ADC_FRAME_SIZE_BYTES, first_frame_index);
     }
-    context->written_bytes += *consumed;
-    context->interval_written_bytes += *consumed;
+    context->consumed_raw_bytes += *consumed;
     if (result == ESP_OK) {
         return APPEND_OK;
     }
@@ -668,7 +680,7 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     const frame_sync_status_t sync_status =
         frame_sync_get_status(&stream_sync);
     const bool frame_aligned =
-        (context->written_bytes % ADC_FRAME_SIZE_BYTES) == 0U;
+        (context->consumed_raw_bytes % ADC_FRAME_SIZE_BYTES) == 0U;
 
     raw_sd_capture_outcome_t outcome;
     if (!drain_ok || status.failed || rx_stats.fatal || context->io_failed ||
@@ -687,8 +699,8 @@ static bool finish_recording(recording_context_t *context, const char *reason)
     bool success = outcome == RAW_SD_CAPTURE_CLEAN ||
                    outcome == RAW_SD_CAPTURE_CLOSED_WITH_GAPS ||
                    outcome == RAW_SD_CAPTURE_CLOSED_UNCERTAIN_SYNC;
-    const uint64_t valid_bytes = context->written_bytes -
-        (context->written_bytes % ADC_FRAME_SIZE_BYTES);
+    const uint64_t valid_bytes = context->consumed_raw_bytes /
+        ADC_FRAME_SIZE_BYTES * RAW_SD_STORED_FRAME_BYTES;
     const raw_sd_segment_diagnostics_t diagnostics = {
         .outcome = outcome,
         .final_sync_state = (uint32_t)sync_status.state,
@@ -733,7 +745,7 @@ static bool finish_recording(recording_context_t *context, const char *reason)
              " | ValidBytes=%" PRIu64,
              capture_outcome_name(outcome),
              frame_sync_state_name(sync_status.state),
-             confirmed_valid_bytes / ADC_FRAME_SIZE_BYTES,
+             confirmed_valid_bytes / RAW_SD_STORED_FRAME_BYTES,
              confirmed_valid_bytes);
     if (confirmed_valid_bytes != valid_bytes) {
         ESP_LOGW(TAG,
@@ -816,7 +828,7 @@ static void log_write_rate(recording_context_t *context,
                  : sync_status.active_candidates,
              sync_status.uncertain_lock_seen ? "yes" : "no",
              status.accepted_frames,
-             context->written_bytes,
+             context->consumed_raw_bytes,
              xRingbufferGetCurFreeSize(raw_ringbuf),
              xRingbufferGetCurFreeSize(data_ringbuf),
              rx_stats.overruns,
@@ -824,7 +836,6 @@ static void log_write_rate(recording_context_t *context,
              status.raw_overflow_bytes,
              status.valid_overflow_frames);
 
-    context->interval_written_bytes = 0;
     context->last_input_bytes = status.raw_input_bytes;
     context->last_valid_frames = status.accepted_frames;
     context->last_physical_bytes = physical_bytes;
@@ -864,10 +875,10 @@ static void update_status_progress(void)
     current_status.physical_bytes =
         raw_recorder.active_segment.physical_bytes;
     current_status.valid_bytes = raw_recorder.segment_open
-        ? manager_recording_context.written_bytes
+        ? manager_recording_context.consumed_raw_bytes / ADC_FRAME_SIZE_BYTES * RAW_SD_STORED_FRAME_BYTES
         : raw_recorder.active_segment.valid_bytes;
     current_status.frame_count = current_status.valid_bytes /
-                                 ADC_FRAME_SIZE_BYTES;
+                                 RAW_SD_STORED_FRAME_BYTES;
     current_status.raw_input_bytes = capture.raw_input_bytes;
     current_status.dma_blocks = rx_stats.completed_blocks;
     current_status.dma_overruns = rx_stats.overruns;
@@ -884,6 +895,8 @@ static void update_status_progress(void)
     xSemaphoreGive(status_mutex);
 }
 
+/* 同步请求：result指向调用者栈，收到完成通知前不能提前返回。
+ * 默认任务通知槽用于本次回复；新增通知用途时需检查冲突。 */
 static esp_err_t submit_request(storage_request_t *request)
 {
     if (request_queue == NULL || request == NULL) {
@@ -932,7 +945,7 @@ static esp_err_t prepare_card(void)
         raw_sd_recorder_data_capacity_sectors(&raw_recorder) *
         RAW_SD_SECTOR_BYTES;
     current_status.target_frames =
-        current_status.target_bytes / ADC_FRAME_SIZE_BYTES;
+        current_status.target_bytes / RAW_SD_STORED_FRAME_BYTES;
     current_status.emmc_clock_khz =
         (uint32_t)raw_recorder.card.real_freq_khz;
     current_status.card_ready = true;
@@ -1003,7 +1016,7 @@ static esp_err_t start_capture(void)
 
     const uint64_t remaining_capacity =
         raw_sd_recorder_remaining_capacity_bytes(&raw_recorder);
-    capture_frame_limit = remaining_capacity / ADC_FRAME_SIZE_BYTES;
+    capture_frame_limit = remaining_capacity / RAW_SD_STORED_FRAME_BYTES;
     if (capture_frame_limit == 0U) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -1060,7 +1073,7 @@ static esp_err_t start_capture(void)
     xSemaphoreGive(status_mutex);
     set_state(EMMC_STATE_WRITING, ESP_OK);
     ESP_LOGI(TAG,
-             "ADC CAPTURE STARTED: header=FFFF0000, frame=%u bytes",
+             "ADC CAPTURE STARTED: storage=PACKED132, header=FFFF0000, input_frame=%u bytes",
              ADC_FRAME_SIZE_BYTES);
     return ESP_OK;
 }

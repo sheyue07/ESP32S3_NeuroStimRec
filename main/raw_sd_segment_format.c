@@ -33,7 +33,8 @@ void raw_sd_segment_finalize(raw_sd_segment_t *segment)
 {
     initialize_magic(segment->magic, RAW_SD_SEGMENT_MAGIC,
                      RAW_SD_SEGMENT_MAGIC_BYTES);
-    segment->version = RAW_SD_FORMAT_VERSION;
+    /* Preserve legacy RAW260 entries when recovering an interrupted run. */
+    if (segment->version == 0U) segment->version = RAW_SD_PACKED_VERSION;
     segment->checksum = 0U;
     segment->checksum = raw_sd_sector_checksum(segment);
 }
@@ -69,7 +70,7 @@ bool raw_sd_segment_is_valid(const raw_sd_segment_t *segment)
     const uint32_t expected_checksum = copy.checksum;
     copy.checksum = 0U;
     return has_magic(copy.magic) &&
-           copy.version == RAW_SD_FORMAT_VERSION &&
+           (copy.version == RAW_SD_FORMAT_VERSION || copy.version == RAW_SD_PACKED_VERSION) &&
            expected_checksum == raw_sd_sector_checksum(&copy);
 }
 

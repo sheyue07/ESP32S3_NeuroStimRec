@@ -1,4 +1,5 @@
 #include "uart_bridge.h"
+#include "cpu_monitor.h"
 
 #include <ctype.h>
 #include <inttypes.h>
@@ -12,17 +13,38 @@
 #include "driver/uart.h"
 #include "emmc_storage_manager.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "raw_sd_segment_format.h"
 #include "sdkconfig.h"
 
 #define COMMAND_BYTES 160U
+#define STIM_LOG_COUNT 16U
+static portMUX_TYPE s_stim_log_lock = portMUX_INITIALIZER_UNLOCKED;
+static char s_stim_logs[STIM_LOG_COUNT][384];
+static uint32_t s_stim_log_sequence;
+
+void uart_bridge_stim_log(const char *format, ...)
+{
+    char line[384];
+    int offset = snprintf(line, sizeof(line), "uptime_ms=%" PRIi64 " ",
+                          esp_timer_get_time() / 1000);
+    va_list args;
+    va_start(args, format);
+    vsnprintf(line + offset, sizeof(line) - offset, format, args);
+    va_end(args);
+    portENTER_CRITICAL(&s_stim_log_lock);
+    memcpy(s_stim_logs[s_stim_log_sequence % STIM_LOG_COUNT], line, sizeof(line));
+    ++s_stim_log_sequence;
+    portEXIT_CRITICAL(&s_stim_log_lock);
+}
 #define PACKET_PAYLOAD_BYTES 2048U
 #define PACKET_MAGIC "EMB1"
 #define PACKET_ACK_MAGIC "EMA1"
 #define PACKET_ACK_TIMEOUT_MS 3000U
 #define PACKET_RETRY_LIMIT 5U
 #define PACKET_ACK_ACCEPT 0U
+#define PACKET_ACK_RETRY 1U
 #define EMMC_READ_ATTEMPT_LIMIT 3U
 
 typedef struct __attribute__((packed)) {
@@ -103,15 +125,42 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t bytes)
     return ~crc;
 }
 
-static bool receive_packet_ack(uint32_t sequence)
+typedef enum {
+    PACKET_ACK_RESULT_ACCEPT,
+    PACKET_ACK_RESULT_RETRY,
+    PACKET_ACK_RESULT_INVALID,
+} packet_ack_result_t;
+
+static packet_ack_result_t receive_packet_ack(uint32_t sequence)
 {
     packet_ack_t ack = {0};
-    const int received = uart_read_bytes(
-        bridge_uart, &ack, sizeof(ack),
-        pdMS_TO_TICKS(PACKET_ACK_TIMEOUT_MS));
-    return received == (int)sizeof(ack) &&
-           memcmp(ack.magic, PACKET_ACK_MAGIC, sizeof(ack.magic)) == 0 &&
-           ack.sequence == sequence && ack.status == PACKET_ACK_ACCEPT;
+    size_t received = 0U;
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(PACKET_ACK_TIMEOUT_MS);
+    const TickType_t started = xTaskGetTickCount();
+    while (received < sizeof(ack)) {
+        const TickType_t elapsed = xTaskGetTickCount() - started;
+        if (elapsed >= timeout_ticks) {
+            return PACKET_ACK_RESULT_INVALID;
+        }
+        const int chunk = uart_read_bytes(
+            bridge_uart, (uint8_t *)&ack + received, sizeof(ack) - received,
+            timeout_ticks - elapsed);
+        if (chunk <= 0) {
+            return PACKET_ACK_RESULT_INVALID;
+        }
+        received += (size_t)chunk;
+    }
+    if (memcmp(ack.magic, PACKET_ACK_MAGIC, sizeof(ack.magic)) != 0 ||
+        ack.sequence != sequence) {
+        return PACKET_ACK_RESULT_INVALID;
+    }
+    if (ack.status == PACKET_ACK_ACCEPT) {
+        return PACKET_ACK_RESULT_ACCEPT;
+    }
+    if (ack.status == PACKET_ACK_RETRY) {
+        return PACKET_ACK_RESULT_RETRY;
+    }
+    return PACKET_ACK_RESULT_INVALID;
 }
 
 static bool parse_u64(const char *text, uint64_t *value)
@@ -285,8 +334,9 @@ static esp_err_t stream_bytes(emmc_storage_access_t *access,
                     pdMS_TO_TICKS(PACKET_ACK_TIMEOUT_MS)) != ESP_OK) {
                 return ESP_FAIL;
             }
-            acknowledged = receive_packet_ack(sequence);
-            if (!acknowledged) {
+            const packet_ack_result_t ack = receive_packet_ack(sequence);
+            acknowledged = ack == PACKET_ACK_RESULT_ACCEPT;
+            if (ack == PACKET_ACK_RESULT_INVALID) {
                 (void)uart_flush_input(bridge_uart);
             }
         }
@@ -376,7 +426,8 @@ static esp_err_t command_list(emmc_storage_access_t *access)
                       " physical=%" PRIu64 " valid=%" PRIu64
                       " frames=%" PRIu64 " data_crc=%08" PRIX32
                       " outcome=%" PRIu32 " events=%" PRIu32
-                      " event_overflow=%" PRIu32 " failure=0x%" PRIX32,
+                      " event_overflow=%" PRIu32 " failure=0x%" PRIX32
+                      " format=%s frame_bytes=%" PRIu32,
                       index, segment.segment_id,
                       segment_state_name(segment.state), segment.run_id,
                       segment.start_lba,
@@ -384,7 +435,9 @@ static esp_err_t command_list(emmc_storage_access_t *access)
                       segment.frame_count, segment.data_checksum,
                       segment.capture_outcome,
                       segment.event_count, segment.event_overflow,
-                      segment.failure_code);
+                      segment.failure_code,
+                      segment.version == RAW_SD_PACKED_VERSION ? "PACKED132" : "RAW260",
+                      raw_sd_segment_frame_bytes(&segment));
         } else {
             uart_line("SEG index=%" PRIu32 " invalid=1 code=0x%x",
                       index, (unsigned int)result);
@@ -462,7 +515,7 @@ static void command_status(void)
         return;
     }
     const double raw_rate = status.write_elapsed_us > 0U
-        ? ((double)status.physical_bytes * 1000000.0) /
+        ? ((double)status.raw_input_bytes * 1000000.0) /
           ((double)status.write_elapsed_us * 1024.0 * 1024.0)
         : 0.0;
     const double end_to_end_rate = status.wall_elapsed_us > 0U
@@ -512,7 +565,7 @@ static void command_info(void)
 static void command_help(void)
 {
     uart_line("OK HELP");
-    uart_line("PING | STATUS | INFO | LIST | REINIT");
+    uart_line("PING | STATUS | INFO | LIST | REINIT | CPUSTAT");
     uart_line("DATA <segment_index> [byte_offset] [byte_length]");
     uart_line("READ <lba> <sector_count>");
     uart_line("EVENTS <segment_index>");
@@ -546,8 +599,50 @@ static void dispatch_command(char *line)
     if (strcasecmp(command, "PING") == 0 && arg1 == NULL) {
         uart_line("OK PONG");
         uart_line("OK END");
+    } else if (strcasecmp(command, "STIMLOG") == 0 && arg1 != NULL && arg2 == NULL) {
+        char *end = NULL;
+        uint32_t cursor = strtoul(arg1, &end, 10);
+        if (*arg1 == '\0' || *end != '\0') {
+            uart_line("ERR ARG invalid_cursor");
+            return;
+        }
+        portENTER_CRITICAL(&s_stim_log_lock);
+        const uint32_t latest = s_stim_log_sequence;
+        portEXIT_CRITICAL(&s_stim_log_lock);
+        if (cursor > latest) cursor = 0; /* Device restarted. */
+        const uint32_t oldest = latest > STIM_LOG_COUNT ? latest - STIM_LOG_COUNT : 0;
+        uart_line("OK STIMLOG latest=%" PRIu32 " lost=%" PRIu32,
+                  latest, cursor < oldest ? oldest - cursor : 0);
+        if (cursor < oldest) cursor = oldest;
+        for (; cursor < latest; ++cursor) {
+            char entry[384];
+            portENTER_CRITICAL(&s_stim_log_lock);
+            const bool retained = s_stim_log_sequence - cursor <= STIM_LOG_COUNT;
+            if (retained) memcpy(entry, s_stim_logs[cursor % STIM_LOG_COUNT], sizeof(entry));
+            portEXIT_CRITICAL(&s_stim_log_lock);
+            if (retained) uart_line("STIMLOG %s", entry);
+            else uart_line("STIMLOG history_overwritten");
+        }
+        uart_line("OK END");
     } else if (strcasecmp(command, "STATUS") == 0 && arg1 == NULL) {
         command_status();
+    } else if (strcasecmp(command, "CPUSTAT") == 0 && arg1 == NULL) {
+        /* Dispatch is serialized with run_read(); never emitted inside EMB1. */
+        cpu_monitor_snapshot_t s;
+        const bool valid = cpu_monitor_get_snapshot(&s);
+        char busy[64] = "cpu0_busy_pct=NA cpu1_busy_pct=NA";
+        if (valid) snprintf(busy, sizeof(busy),
+            "cpu0_busy_pct=%u.%u cpu1_busy_pct=%u.%u",
+            s.busy_permille[0] / 10, s.busy_permille[0] % 10,
+            s.busy_permille[1] / 10, s.busy_permille[1] % 10);
+        uart_line("OK CPUSTAT valid=%u state=%s seq=%" PRIu64
+                  " sampled_us=%" PRIu64 " window_us=%" PRIu64
+                  " age_ms=%" PRIu64 " %s snapshot_us=%" PRIu64
+                  " invalid_windows=%" PRIu32 " error=0x%X",
+                  valid ? 1U : 0U, cpu_monitor_state_name(s.state), s.sequence,
+                  s.sampled_us, s.window_us, s.age_ms, busy, s.snapshot_us,
+                  s.invalid_windows, (unsigned)s.error);
+        uart_line("OK END");
     } else if (strcasecmp(command, "INFO") == 0 && arg1 == NULL) {
         command_info();
     } else if (strcasecmp(command, "HELP") == 0 && arg1 == NULL) {

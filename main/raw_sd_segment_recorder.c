@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "frame_sync.h"
+#include "adc_frame_pack.h"
 #include "sdkconfig.h"
 
 static const char *TAG = "RAW_EMMC_REC";
@@ -30,6 +31,8 @@ _Static_assert(RAW_SD_RECORDER_WRITE_BUFFER_BYTES % RAW_SD_SECTOR_BYTES == 0U,
                "write buffer must contain whole sectors");
 _Static_assert(RAW_SD_FRAME_BYTES == ADC_FRAME_SIZE_BYTES,
                "raw eMMC frame size must match the stream parser");
+_Static_assert(RAW_SD_STORED_FRAME_BYTES == ADC_PACKED_FRAME_BYTES,
+               "packed metadata must match the packer");
 
 static esp_err_t write_superblocks(raw_sd_recorder_t *recorder)
 {
@@ -119,9 +122,9 @@ static esp_err_t write_data_block(raw_sd_recorder_t *recorder,
         recorder->superblock.physical_bytes_written >=
             recorder->next_metadata_bytes) {
         recorder->active_segment.valid_bytes =
-            recorder->active_pending_valid_bytes;
+            recorder->active_pending_valid_bytes / RAW_SD_STORED_FRAME_BYTES * RAW_SD_STORED_FRAME_BYTES;
         recorder->active_segment.frame_count =
-            recorder->active_segment.valid_bytes / RAW_SD_FRAME_BYTES;
+            recorder->active_segment.valid_bytes / RAW_SD_STORED_FRAME_BYTES;
         recorder->active_segment.metadata_generation =
             recorder->superblock.generation + 1U;
         esp_err_t checkpoint_result = write_active_segment(recorder);
@@ -365,7 +368,7 @@ esp_err_t raw_sd_recorder_resume_run(raw_sd_recorder_t *recorder)
              segment.state != RAW_SD_SEGMENT_FAILED) ||
             segment.physical_bytes % RAW_SD_SECTOR_BYTES != 0U ||
             segment.valid_bytes > segment.physical_bytes ||
-            segment.valid_bytes % RAW_SD_FRAME_BYTES != 0U) {
+            segment.valid_bytes % raw_sd_segment_frame_bytes(&segment) != 0U) {
             ESP_LOGE(TAG, "Invalid eMMC directory entry at index %" PRIu32,
                      index);
             return ESP_ERR_INVALID_CRC;
@@ -513,24 +516,29 @@ esp_err_t raw_sd_recorder_append(raw_sd_recorder_t *recorder,
     const uint64_t physically_available =
         capacity_bytes - recorder->superblock.physical_bytes_written -
         recorder->write_buffer_used;
+    /* API consumes RAW260; only PACKED132 enters the disk write cache. */
     const uint64_t remaining = physically_available /
-        RAW_SD_FRAME_BYTES * RAW_SD_FRAME_BYTES;
+        RAW_SD_STORED_FRAME_BYTES * RAW_SD_FRAME_BYTES;
     const size_t accepted = length > remaining ? (size_t)remaining : length;
     size_t offset = 0U;
     while (offset < accepted) {
-        const size_t available = RAW_SD_RECORDER_WRITE_BUFFER_BYTES - recorder->write_buffer_used;
-        const size_t copy_bytes = accepted - offset < available ? accepted - offset : available;
-        memcpy(recorder->write_buffer + recorder->write_buffer_used, frames + offset, copy_bytes);
-        recorder->write_buffer_used += copy_bytes;
-        offset += copy_bytes;
-        recorder->active_pending_valid_bytes += copy_bytes;
-        if (consumed != NULL) {
-            *consumed += copy_bytes;
+        uint8_t packed[ADC_PACKED_FRAME_BYTES];
+        adc_frame_pack(packed, frames + offset);
+        size_t packed_offset = 0U;
+        while (packed_offset < sizeof(packed)) {
+            const size_t available = RAW_SD_RECORDER_WRITE_BUFFER_BYTES - recorder->write_buffer_used;
+            const size_t left = sizeof(packed) - packed_offset;
+            const size_t copy_bytes = left < available ? left : available;
+            memcpy(recorder->write_buffer + recorder->write_buffer_used,
+                   packed + packed_offset, copy_bytes);
+            recorder->write_buffer_used += copy_bytes;
+            recorder->active_pending_valid_bytes += copy_bytes;
+            packed_offset += copy_bytes;
+            const esp_err_t result = flush_full_buffer(recorder);
+            if (result != ESP_OK) return result;
         }
-        const esp_err_t result = flush_full_buffer(recorder);
-        if (result != ESP_OK) {
-            return result;
-        }
+        offset += RAW_SD_FRAME_BYTES;
+        if (consumed != NULL) *consumed += RAW_SD_FRAME_BYTES;
     }
     if (accepted != length) {
         recorder->run_full = true;
@@ -644,7 +652,7 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
         confirmed_valid_bytes = unflushed_bytes < confirmed_valid_bytes
             ? confirmed_valid_bytes - unflushed_bytes
             : 0U;
-        confirmed_valid_bytes -= confirmed_valid_bytes % RAW_SD_FRAME_BYTES;
+        confirmed_valid_bytes -= confirmed_valid_bytes % RAW_SD_STORED_FRAME_BYTES;
         final_state = RAW_SD_SEGMENT_FAILED;
         failure_code = result;
         recorder->active_segment.capture_outcome =
@@ -668,8 +676,11 @@ esp_err_t raw_sd_recorder_close_segment(raw_sd_recorder_t *recorder,
                 RAW_SD_CAPTURE_FAILED_PIPELINE;
         }
     }
+    /* An I/O failure can leave a partial packed frame even if a later tail
+     * flush succeeds. Never publish that fragment as valid data. */
+    confirmed_valid_bytes -= confirmed_valid_bytes % RAW_SD_STORED_FRAME_BYTES;
     recorder->active_segment.valid_bytes = confirmed_valid_bytes;
-    recorder->active_segment.frame_count = recorder->active_segment.valid_bytes / RAW_SD_FRAME_BYTES;
+    recorder->active_segment.frame_count = recorder->active_segment.valid_bytes / RAW_SD_STORED_FRAME_BYTES;
     recorder->superblock.valid_bytes_written +=
         recorder->active_segment.valid_bytes;
     recorder->active_segment.state = final_state;

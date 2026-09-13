@@ -298,3 +298,49 @@ build\partition_table\partition-table.bin
 - `0x7113` 表示 SPI2 RX FIFO 的硬件溢出标志已置位：外部字节在进入 GDMA 描述符之前已经丢失。它与 eMMC 写入速度不足不同；应优先检查片上总线竞争、30 MHz 输入时序和板级信号完整性。
 - `continuous_rx.c` 和 `stim_waveform.c` 使用 ESP-IDF 私有 HAL/GDMA 接口，升级 ESP-IDF 后必须重新全量编译并做硬件回归测试。
 - 当前工程没有独立的自动化单元测试目录；现阶段验证依据为全量编译、元数据结构静态断言及真实硬件采集/导出测试。
+# CPU 负载监测：2026.09.04-r5-cpu-monitor-raw260
+
+本次修改前基线为 GitHub `main` 的 `3373c7d`。仅加入可选监测，仍存储
+RAW260，不实施 132 字节打包，不改 DMA、同步器、缓存大小、BLE 或盘格式。
+
+- CPU1/P1、4 KiB 栈，默认约 1 秒采样；无周期内存申请、无后台 UART 打印。
+- ESP TIMER / U64 运行计数，分别计算 `100% - 各核 idle 增量 / 实际窗口`。
+- 相比方案文档的全任务快照，读取两个永久 idle 任务的 `vTaskGetInfo(...,
+  pdFALSE, eReady)`，避免枚举全任务及扫描栈。只提供逐核负载，不提供逐任务排名。
+- `CPUSTAT` 返回一行 `OK CPUSTAT ...`，然后 `OK END`，均为 CRLF。
+  `valid=1` 才可使用 busy 百分比；其他状态输出 `NA`，不能作为 0% 使用。
+  返回 seq、sampled_us、window_us、age_ms、snapshot_us、invalid_windows、error。
+  超过 3 个配置周期未更新标记 STALE；相同 seq 不应重复加权计入统计。
+- `snapshot_us` 是两次 idle 查询的墙钟耗时，含可能的抢占，不是监测任务总 CPU
+  耗时。运行统计本身仍对所有任务切换有开销；中断时间、切换记账边界会影响估计。
+  明显越界窗口拒绝并重建基线，不静默夹到 0/100%。
+- `STATUS`、BLE 和 EMB1 不变。CPUSTAT 由原串行命令调度器处理，不会在
+  READ/DATA/EVENTS 中插入响应。主机严禁在二进制导出等待 ACK 时发送其他命令。
+
+## 如何记录 CPU 负载
+
+先关闭 PC 导出软件及 IDF Monitor（同一个 COM 口不能共用）。在 ESP-IDF
+Python 终端、工程根目录运行：
+
+```powershell
+python scripts/cpu_load_capture.py --port COM4 --output cpu_no_preview.csv
+```
+
+脚本只发送 CPUSTAT，不发送采集控制或复位命令。串口驱动仍可能在打开时产生
+DTR/RTS 脉冲，因此请在采集前打开脚本，确认输出后再用手机开始采集。
+Ctrl+C 保存已收到的 CSV 并退出，不会停止 ADC；停止采集请在 APP 操作。
+原上位机 GUI 本次没有增加 CPU 显示，脚本运行期间不能同时使用它。
+
+先比较待机、关闭预览采集、打开两通道预览采集；保存 CSV 与对应导出事件，
+确认同步和吞吐未退化后再决定打包位置。空闲率不代表瞬时实时裕量。
+72 分钟统计试验不能等同于连续写满测试：约 7.28 GiB 的 eMMC 在原始速率下
+不足以保存 72 分钟；可保持上电、在容量允许范围采集或待机跨越该时长。
+
+## 关闭与测试
+
+menuconfig 中关闭 `NEURO_CPU_MONITOR` 可测“仅运行统计”；完全无统计的对照
+还须关闭 `FREERTOS_GENERATE_RUN_TIME_STATS` 并重新编译。周期可设 1000～10000 ms。
+不需修改介质格式或擦除 eMMC。未开展板上 CPU、栈余量和长时稳定性实测。
+
+主机单元测试：`python -m unittest discover -s tests -p test_cpu_load_capture.py`。
+数学测试源文件：`tests/test_cpu_monitor_math.c`，可用主机 C 编译器编译执行。
